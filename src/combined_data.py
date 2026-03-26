@@ -132,6 +132,28 @@ class CombinedData:
         df = self._filter_by_subset(self._full_df[cols], subset_types)
         return df.reset_index()
 
+    def get_one_score_selected_feats_subset(
+            self,
+            tech_name: str,
+            feat_names: List[str],
+            subset_types: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        获取指定技巧、特征和子集的表 (audio_filename, tech_name, feat_names...)。
+        tech_name: 技巧列名 (如 'vibrato')。
+        feat_names: 特征列名列表 (如 ['Jitter', 'Shimmer'])。
+        subset_types: 子集列表 (如 ['A', '1'])。若为 None，则返回全部。
+        """
+        if tech_name not in self.tech_cols:
+            raise ValueError(f"技巧 '{tech_name}' 不在已知技巧列表中：{self.tech_cols}")
+        for feat in feat_names:
+            if feat not in self.feat_cols:
+                raise ValueError(f"特征 '{feat}' 不在已知特征列表中：{self.feat_cols}")
+
+        cols = [tech_name] + feat_names
+        df = self._filter_by_subset(self._full_df[cols], subset_types)
+        return df.reset_index()
+
     @staticmethod
     def _filter_by_subset(df: pd.DataFrame, subset_types: Optional[List[str]]) -> pd.DataFrame:
         """内部辅助函数：根据文件名后缀过滤行。"""

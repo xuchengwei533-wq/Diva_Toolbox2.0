@@ -348,7 +348,7 @@ if __name__ == '__main__':
     outputs_root = os.path.join(proj_root, "outputs")
     raw_feats_dir = os.path.join(outputs_root, "raw_feats", dataset_name)
     print("[*] 开始提取特征统计信息...")
-    from src.feat_extractor import extract_feats_stats_from_csv
+    from src.feat_extract.feat_extractor import extract_feats_stats_from_csv
     df_feats_stats = extract_feats_stats_from_csv(raw_feats_dir)
     print("[*] 开始绘制散点图...")
     for ndim in [1, 2, 3]:

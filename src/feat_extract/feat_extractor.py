@@ -428,7 +428,7 @@ def extract_feats_stats_from_csv(raw_feats_dir, output_dir=None) -> pd.DataFrame
 
 if __name__ == '__main__':
     # 切换到项目根目录
-    proj_root = os.path.abspath(os.path.join(__file__, "../.."))
+    proj_root = os.path.abspath(os.path.join(__file__, "../../.."))
     os.chdir(proj_root)
     print(f"[*] 项目根目录：{proj_root}")
 

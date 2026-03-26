@@ -612,7 +612,7 @@ if __name__ == '__main__':
     matrix_dir = os.path.join(outputs_root, "matrix")
 
     print("[*] 开始提取特征统计信息...")
-    from src.feat_extractor import extract_feats_stats_from_csv
+    from src.feat_extract.feat_extractor import extract_feats_stats_from_csv
     df_stats = extract_feats_stats_from_csv(raw_feats_dir)
     print(df_stats.head())
     print(f"[*] 加载评分矩阵：{score_file}")
@@ -632,7 +632,7 @@ if __name__ == '__main__':
     #         run_lasso_analysis(combined_data, tech, analysis_dir, subset_group)
     #         run_ordinal_regression(combined_data, tech, analysis_dir, subset_group)
 
-    run_correlation_matrix(combined_data, matrix_dir)
-    # run_lasso_correlation_matrix(combined_data, matrix_dir)
-    # run_ordinal_correlation_matrix(combined_data, matrix_dir, metric="coef")
-    # run_ordinal_correlation_matrix(combined_data, matrix_dir, metric="or")
+    run_correlation_matrix(combined_data, matrix_dir, ["B", "1"])
+    run_lasso_correlation_matrix(combined_data, matrix_dir, ["B", "1"])
+    run_ordinal_correlation_matrix(combined_data, matrix_dir, ["B", "1"], metric="coef")
+    run_ordinal_correlation_matrix(combined_data, matrix_dir, ["B", "1"], metric="or")

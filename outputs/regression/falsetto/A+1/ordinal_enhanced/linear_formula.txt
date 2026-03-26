@@ -1,0 +1,5 @@
+Linear Predictor (Z) = 3.1897*HighFreqNoiseRatio + -1.0648*LowFreqEnergyRatio + 1.6468*QValue + -1.3048*Shimmer
+P(Score <= k) = Probit_CDF(Threshold_k - Z)
+
+LOOCV Accuracy: 0.814
+LOOCV Kappa: 0.861
