@@ -1,6 +1,8 @@
 import argparse
+from itertools import combinations
 import os
 import threading
+import traceback
 from pathlib import Path
 from tkinter import BooleanVar, IntVar, StringVar, Tk, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -9,8 +11,12 @@ from typing import Callable, List, Optional
 # 强制使用无界面后端，避免 Tk 主线程与后台绘图线程在退出时冲突。
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+import matplotlib.pyplot as plt
+import pandas as pd
+
 from src.combined_data import CombinedData
 from src.data_loader import load_score_matrix
+from src.data_parser import parse_label
 from src.feat_extract.feat_extractor import extract_feats_from_wav_dir, extract_feats_stats_from_csv
 from src.models import (
     run_correlation_matrix,
@@ -80,6 +86,93 @@ def _list_score_files(project_root: Path, dataset_name: str) -> List[str]:
     return sorted([p.name for p in dataset_dir.glob("*.xlsx")])
 
 
+def _plot_unsupervised_ndim(df_stats: pd.DataFrame, outputs_root: Path, ndim: int):
+    if df_stats.empty:
+        return
+    feat_cols = list(df_stats.columns)
+    if len(feat_cols) == 0:
+        return
+
+    plot_dir = outputs_root / f"plot_{ndim}d"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    df_plot = df_stats.reset_index(drop=False)
+    filename_col = df_plot.columns[0]
+    df_plot["score_label"] = df_plot[filename_col].map(parse_label)
+    color_map = {1: "#d62728", 3: "#2ca02c", 5: "#1f77b4"}
+
+    if ndim == 1:
+        for feat in feat_cols:
+            fig = plt.figure(figsize=(8, 5), dpi=140)
+            sub = df_plot[[feat, "score_label"]].dropna(subset=[feat]).copy()
+            if sub.empty:
+                plt.close(fig)
+                continue
+            if sub["score_label"].notna().any():
+                x = sub["score_label"].astype(float).values
+                # 稳定的轻微抖动，避免重叠
+                jitter = ((pd.Series(range(len(x))).values % 11) - 5) * 0.015
+                xj = x + jitter
+                colors = [color_map.get(int(s), "#7f7f7f") for s in x]
+                plt.scatter(xj, sub[feat].values, s=26, alpha=0.8, c=colors)
+                plt.xticks([1, 3, 5])
+                plt.xlabel("Score Label")
+                handles = [
+                    plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color_map[k], label=f"Score {k}", markersize=7)
+                    for k in sorted(color_map.keys())
+                ]
+                plt.legend(handles=handles, title="Score", loc="best", fontsize=8)
+            else:
+                # 文件名里没有可解析分数时，退化为按样本序号散点
+                plt.scatter(range(len(sub)), sub[feat].values, s=26, alpha=0.8, c="#7f7f7f")
+                plt.xlabel("Sample Index")
+            plt.ylabel(feat)
+            plt.title(f"1D Scatter: {feat}")
+            plt.grid(alpha=0.25, linestyle="--")
+            plt.tight_layout()
+            fig.savefig(plot_dir / f"scatter_1d_{feat}.png", dpi=300)
+            plt.close(fig)
+        return
+
+    combos = list(combinations(feat_cols, ndim))
+    for combo in combos:
+        cols = list(combo)
+        sub = df_plot[cols].dropna()
+        if sub.empty:
+            continue
+
+        if ndim == 2:
+            fig = plt.figure(figsize=(8, 6), dpi=140)
+            if "score_label" in df_plot.columns and df_plot["score_label"].notna().any():
+                score_sub = df_plot.loc[sub.index, "score_label"].fillna(-1).astype(int)
+                colors = [color_map.get(s, "#7f7f7f") for s in score_sub.values]
+            else:
+                colors = "#59A14F"
+            plt.scatter(sub[cols[0]], sub[cols[1]], s=28, alpha=0.75, c=colors)
+            plt.xlabel(cols[0])
+            plt.ylabel(cols[1])
+            plt.title(f"2D Scatter: {cols[0]} vs {cols[1]}")
+            plt.grid(alpha=0.25, linestyle="--")
+            plt.tight_layout()
+            fig.savefig(plot_dir / f"scatter_2d_{cols[0]}_{cols[1]}.png", dpi=300)
+            plt.close(fig)
+        elif ndim == 3:
+            fig = plt.figure(figsize=(9, 7), dpi=140)
+            ax = fig.add_subplot(111, projection="3d")
+            if "score_label" in df_plot.columns and df_plot["score_label"].notna().any():
+                score_sub = df_plot.loc[sub.index, "score_label"].fillna(-1).astype(int)
+                colors = [color_map.get(s, "#7f7f7f") for s in score_sub.values]
+            else:
+                colors = "#E15759"
+            ax.scatter(sub[cols[0]], sub[cols[1]], sub[cols[2]], s=24, alpha=0.75, c=colors)
+            ax.set_xlabel(cols[0])
+            ax.set_ylabel(cols[1])
+            ax.set_zlabel(cols[2])
+            ax.set_title(f"3D Scatter: {cols[0]}, {cols[1]}, {cols[2]}")
+            plt.tight_layout()
+            fig.savefig(plot_dir / f"scatter_3d_{cols[0]}_{cols[1]}_{cols[2]}.png", dpi=300)
+            plt.close(fig)
+
+
 def run_pipeline(
         project_root: Path,
         cfg,
@@ -100,10 +193,17 @@ def run_pipeline(
     cfg_score_file = None
     if "dataset" in cfg and "score_file" in cfg.dataset:
         cfg_score_file = cfg.dataset.score_file
-    score_path = _resolve_score_file(dataset_dir, score_file_name, cfg_score_file)
+    score_path = None
+    try:
+        score_path = _resolve_score_file(dataset_dir, score_file_name, cfg_score_file)
+    except FileNotFoundError:
+        log("[!] 未找到评分文件：将进入无监督模式（仅提特征与绘图，跳过回归/矩阵分析）。")
 
     log(f"[*] Dataset: {dataset_name}")
-    log(f"[*] Score file: {score_path.name}")
+    if score_path is not None:
+        log(f"[*] Score file: {score_path.name}")
+    else:
+        log("[*] Score file: None")
 
     outputs_root = project_root / "outputs"
     dataset_output_root = outputs_root / dataset_name
@@ -126,54 +226,67 @@ def run_pipeline(
 
     log("[*] Step 2/6: build merged table")
     df_stats = extract_feats_stats_from_csv(str(raw_feats_dir), str(dataset_output_root))
-    df_score = load_score_matrix(str(score_path))
-    if df_score.empty:
-        raise ValueError("Loaded score matrix is empty.")
     if df_stats.empty:
         raise ValueError("Extracted feature stats are empty.")
 
-    combined = CombinedData(df_score, df_stats)
-    combined.save_to_csv(str(dataset_output_root), filename=f"score_feats_data_{dataset_name}.csv")
+    combined = None
+    if score_path is not None:
+        df_score = load_score_matrix(str(score_path))
+        if df_score.empty:
+            raise ValueError("Loaded score matrix is empty.")
+        combined = CombinedData(df_score, df_stats)
+        combined.save_to_csv(str(dataset_output_root), filename=f"score_feats_data_{dataset_name}.csv")
+    else:
+        log("[*] 跳过评分表合并（无评分文件）。")
 
     log("[*] Step 3/6: scatter plots (1D, 2D, 3D)")
     for ndim in [1, 2, 3]:
-        plot_scatter_ndim(df_stats, str(dataset_output_root), ndim)
+        if score_path is None:
+            _plot_unsupervised_ndim(df_stats, dataset_output_root, ndim)
+        else:
+            plot_scatter_ndim(df_stats, str(dataset_output_root), ndim)
 
-    log("[*] Step 4/6: LASSO analysis")
-    subset_groups = _normalize_subset_groups(cfg.dataset.subset_groups if "dataset" in cfg else None)
-    target_techs = list(cfg.vocal_techs) if "vocal_techs" in cfg else list(combined.tech_cols)
-    for tech in target_techs:
+    if combined is not None:
+        log("[*] Step 4/6: LASSO analysis")
+        subset_groups = _normalize_subset_groups(cfg.dataset.subset_groups if "dataset" in cfg else None)
+        target_techs = list(cfg.vocal_techs) if "vocal_techs" in cfg else list(combined.tech_cols)
+        for tech in target_techs:
+            for subsets in subset_groups:
+                run_lasso_analysis(combined, tech, str(analysis_dir), subsets)
+
+        log("[*] Step 5/6: stratified K-fold ordinal regression")
+        for tech in target_techs:
+            for subsets in subset_groups:
+                run_ordinal_regression_with_stratified_kfold_cv(
+                    combined,
+                    tech,
+                    str(regression_dir),
+                    subsets=subsets,
+                    n_splits=n_splits,
+                )
+
+        log("[*] Step 6/6: matrix outputs (matrix, matrix_A1, matrix_B1)")
         for subsets in subset_groups:
-            run_lasso_analysis(combined, tech, str(analysis_dir), subsets)
-
-    log("[*] Step 5/6: stratified K-fold ordinal regression")
-    for tech in target_techs:
-        for subsets in subset_groups:
-            run_ordinal_regression_with_stratified_kfold_cv(
-                combined,
-                tech,
-                str(regression_dir),
-                subsets=subsets,
-                n_splits=n_splits,
-            )
-
-    log("[*] Step 6/6: matrix outputs (matrix, matrix_A1, matrix_B1)")
-    for subsets in subset_groups:
-        matrix_dir = dataset_output_root / _matrix_dir_name(subsets)
-        matrix_dir.mkdir(parents=True, exist_ok=True)
-        run_correlation_matrix(combined, str(matrix_dir), subsets)
-        run_lasso_correlation_matrix(combined, str(matrix_dir), subsets)
-        run_ordinal_correlation_matrix(combined, str(matrix_dir), subsets, metric="coef")
-        run_ordinal_correlation_matrix(combined, str(matrix_dir), subsets, metric="or")
+            matrix_dir = dataset_output_root / _matrix_dir_name(subsets)
+            matrix_dir.mkdir(parents=True, exist_ok=True)
+            run_correlation_matrix(combined, str(matrix_dir), subsets)
+            run_lasso_correlation_matrix(combined, str(matrix_dir), subsets)
+            run_ordinal_correlation_matrix(combined, str(matrix_dir), subsets, metric="coef")
+            run_ordinal_correlation_matrix(combined, str(matrix_dir), subsets, metric="or")
+    else:
+        log("[*] Step 4/6: 跳过（无评分文件）")
+        log("[*] Step 5/6: 跳过（无评分文件）")
+        log("[*] Step 6/6: 跳过（无评分文件）")
 
     log("[+] Full pipeline complete.")
     log(f"    dataset outputs root: {dataset_output_root}")
     log(f"    scatter: {dataset_output_root / 'plot_1d'}")
     log(f"    scatter: {dataset_output_root / 'plot_2d'}")
     log(f"    scatter: {dataset_output_root / 'plot_3d'}")
-    log(f"    matrix: {dataset_output_root / 'matrix'}")
-    log(f"    matrix: {dataset_output_root / 'matrix_A1'}")
-    log(f"    matrix: {dataset_output_root / 'matrix_B1'}")
+    if combined is not None:
+        log(f"    matrix: {dataset_output_root / 'matrix'}")
+        log(f"    matrix: {dataset_output_root / 'matrix_A1'}")
+        log(f"    matrix: {dataset_output_root / 'matrix_B1'}")
 
 
 class PipelineGUI:
@@ -290,8 +403,11 @@ class PipelineGUI:
                 )
                 self.root.after(0, lambda: messagebox.showinfo("完成", "全流程运行完成。"))
             except Exception as e:
-                self.root.after(0, self._append_log, f"[!] 运行失败: {e}")
-                self.root.after(0, lambda: messagebox.showerror("运行失败", str(e)))
+                err_msg = str(e)
+                err_trace = traceback.format_exc()
+                self.root.after(0, self._append_log, f"[!] 运行失败: {err_msg}")
+                self.root.after(0, self._append_log, err_trace)
+                self.root.after(0, lambda msg=err_msg: messagebox.showerror("运行失败", msg))
             finally:
                 self.root.after(0, self._set_running, False)
 

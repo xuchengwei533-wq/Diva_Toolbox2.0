@@ -346,9 +346,16 @@ def extract_feats_from_wav_dir(
     if not os.path.isdir(wav_dir):
         print(f"[!] Directory not found: {wav_dir}")
         return
-    wav_files = [f for f in os.listdir(wav_dir) if f.lower().endswith(".wav")]
-    wav_files = sorted(wav_files)
-    print(f"[*] 在目录 {wav_dir} 中发现 {len(wav_files)} 个 WAV 文件，准备提取特征...")
+    wav_fullpaths = []
+    for root, _dirs, files in os.walk(wav_dir):
+        for f in files:
+            if f.lower().endswith(".wav"):
+                wav_fullpaths.append(os.path.join(root, f))
+    wav_fullpaths = sorted(wav_fullpaths)
+    print(f"[*] 在目录 {wav_dir}（含子目录）中发现 {len(wav_fullpaths)} 个 WAV 文件，准备提取特征...")
+    if len(wav_fullpaths) == 0:
+        print("[!] 未发现 WAV 文件，提取结束。")
+        return
 
     # 输出准备
     if not os.path.isdir(output_dir):
@@ -357,13 +364,15 @@ def extract_feats_from_wav_dir(
 
     # 遍历 WAV 文件，提取特征
     pbar = tqdm(
-        wav_files, total=len(wav_files),
+        wav_fullpaths, total=len(wav_fullpaths),
         desc="提取特征", unit="文件", dynamic_ncols=True
     )
-    for idx, wav_file in enumerate(pbar, start=1):
+    for idx, wav_fullpath in enumerate(pbar, start=1):
         start_t = time.perf_counter()
+        # 使用相对路径避免不同子目录同名文件覆盖
+        rel_path = os.path.relpath(wav_fullpath, wav_dir)
+        wav_file = rel_path.replace(os.sep, "__")
         # 加载单个音频文件
-        wav_fullpath = os.path.join(wav_dir, wav_file)
         audio, original_sr, target_sr = load_audio(wav_fullpath)
         # 提取特征并保存为 CSV 文件
         results = extract_feats_from_single_wav(
@@ -374,8 +383,8 @@ def extract_feats_from_wav_dir(
         cost_s = time.perf_counter() - start_t
         # 更新进度条和日志
         status = ",".join([f"{k}:{v}" for k, v in results])
-        pbar.set_postfix({"步骤": f"{cost_s:.1f}s", "文件": wav_file})
-        tqdm.write(f"[{idx}/{len(wav_files)}] {wav_file} | {status}")
+        pbar.set_postfix({"步骤": f"{cost_s:.1f}s", "文件": rel_path})
+        tqdm.write(f"[{idx}/{len(wav_fullpaths)}] {rel_path} | {status}")
     print("[+] 所有文件的特征提取已完成！")
 
 
