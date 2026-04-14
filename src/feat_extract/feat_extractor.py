@@ -367,7 +367,7 @@ def extract_feats_from_wav_dir(
         audio, original_sr, target_sr = load_audio(wav_fullpath)
         # 提取特征并保存为 CSV 文件
         results = extract_feats_from_single_wav(
-            wav_file, raw_feats_dir, audio, target_sr,
+            wav_file, output_dir, audio, target_sr,
             visualize=visualize,  # 原始特征序列可视化
             overwrite=overwrite,  # 已存在的特征 CSV 文件是否被覆盖（重新提取）
         )

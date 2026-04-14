@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, cohen_kappa_score, mean_absolute_error
-from sklearn.model_selection import LeaveOneOut
+from sklearn.model_selection import LeaveOneOut, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from statsmodels.miscmodels.ordinal_model import OrderedModel
 
@@ -148,6 +148,115 @@ def run_ordinal_regression_with_cv(
 
     print(f"[+] 序数回归完成 | Acc: {acc:.3f}, Kappa: {kappa:.3f}")
     print(f"    显著特征：{sig_coefs['feature'].tolist()}")
+
+
+def run_ordinal_regression_with_stratified_kfold_cv(
+        dataset: CombinedData,
+        tech_name: str,
+        output_dir: str,
+        subsets: Optional[List[str]] = None,
+        n_splits: int = 10,
+):
+    """
+    执行序数回归，并使用分层 K 折交叉验证（默认 10 折）评估泛化表现。
+    会根据最小类别样本数自动下调折数，无法分层时自动跳过。
+    """
+    subset_label = "+".join(subsets) if subsets else "All"
+    print(f"[*] 运行分层K折序数回归 | 技巧：{tech_name} | 子集：{subset_label}")
+
+    df_subset, X, y = _prepare_xy_safe(dataset, tech_name, subsets)
+    if len(y) < 10:
+        print("[!] 跳过：样本量太少 (<10)。")
+        return
+
+    unique_scores = sorted(np.unique(y))
+    class_counts = pd.Series(y).value_counts()
+    min_class_count = int(class_counts.min())
+    effective_splits = min(int(n_splits), min_class_count)
+    if effective_splits < 2:
+        print("[!] 跳过：最小类别样本数不足，无法执行分层交叉验证。")
+        return
+
+    feature_cols = dataset.feat_cols
+    skf = StratifiedKFold(n_splits=effective_splits, shuffle=True, random_state=42)
+    y_true_all = []
+    y_pred_all = []
+    fold_rows = []
+
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        scaler = StandardScaler()
+        X_train_z = scaler.fit_transform(X_train)
+        X_test_z = scaler.transform(X_test)
+
+        df_train = pd.DataFrame(X_train_z, columns=feature_cols)
+        y_train_cat = pd.Categorical(y_train, categories=unique_scores, ordered=True)
+
+        try:
+            model = OrderedModel(endog=y_train_cat, exog=df_train, distr='probit')
+            result = model.fit(method='bfgs', maxiter=3000, disp=False)
+
+            if not result.mle_retvals.get('converged', False):
+                pred = np.full(shape=len(y_test), fill_value=np.bincount(y_train).argmax())
+            else:
+                pred_probs = result.predict(exog=pd.DataFrame(X_test_z, columns=feature_cols))
+                if hasattr(pred_probs, "values"):
+                    pred_probs = pred_probs.values
+                pred_idx = np.argmax(pred_probs, axis=1)
+                pred = np.array([unique_scores[i] for i in pred_idx], dtype=int)
+        except Exception:
+            pred = np.full(shape=len(y_test), fill_value=np.bincount(y_train).argmax())
+
+        fold_acc = accuracy_score(y_test, pred)
+        fold_mae = mean_absolute_error(y_test, pred)
+        try:
+            fold_kappa = cohen_kappa_score(y_test, pred, weights='quadratic')
+        except Exception:
+            fold_kappa = np.nan
+
+        fold_rows.append(
+            {
+                "fold": fold_idx,
+                "train_size": len(train_idx),
+                "test_size": len(test_idx),
+                "accuracy": fold_acc,
+                "quadratic_kappa": fold_kappa,
+                "mae": fold_mae,
+            }
+        )
+        y_true_all.extend(y_test.tolist())
+        y_pred_all.extend(pred.tolist())
+
+    overall_acc = accuracy_score(y_true_all, y_pred_all)
+    overall_mae = mean_absolute_error(y_true_all, y_pred_all)
+    try:
+        overall_kappa = cohen_kappa_score(y_true_all, y_pred_all, weights='quadratic')
+    except Exception:
+        overall_kappa = np.nan
+
+    out_path = os.path.join(output_dir, tech_name, subset_label, "ordinal_kfold")
+    os.makedirs(out_path, exist_ok=True)
+
+    pd.DataFrame(fold_rows).to_csv(os.path.join(out_path, "fold_metrics.csv"), index=False)
+    pd.DataFrame(
+        [
+            {"metric": "Accuracy", "value": overall_acc},
+            {"metric": "Quadratic Kappa", "value": overall_kappa},
+            {"metric": "MAE", "value": overall_mae},
+            {"metric": "n_splits_used", "value": effective_splits},
+            {"metric": "sample_size", "value": len(y)},
+        ]
+    ).to_csv(os.path.join(out_path, "cv_metrics.csv"), index=False)
+    pd.DataFrame({"y_true": y_true_all, "y_pred": y_pred_all}).to_csv(
+        os.path.join(out_path, "cv_predictions.csv"), index=False
+    )
+
+    print(
+        f"[+] 分层K折完成 | splits={effective_splits} | "
+        f"Acc={overall_acc:.3f}, Kappa={overall_kappa:.3f}, MAE={overall_mae:.3f}"
+    )
 
 
 if __name__ == '__main__':
