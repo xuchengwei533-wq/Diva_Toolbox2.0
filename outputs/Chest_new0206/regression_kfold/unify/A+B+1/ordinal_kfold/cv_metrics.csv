@@ -1,0 +1,6 @@
+metric,value
+Accuracy,0.7551020408163265
+Quadratic Kappa,0.7695021560172481
+MAE,0.4897959183673469
+n_splits_used,10.0
+sample_size,98.0

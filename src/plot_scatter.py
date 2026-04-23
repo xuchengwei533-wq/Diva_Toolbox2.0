@@ -153,6 +153,25 @@ def create_legend_handles_score(ax):
     return handles
 
 
+def _compute_axis_limits(values, pad_ratio=0.05):
+    """
+    基于输入数值计算统一坐标轴范围，并添加少量边距，避免点贴边显示。
+    """
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+
+    vmin = float(np.min(arr))
+    vmax = float(np.max(arr))
+    if np.isclose(vmin, vmax):
+        base = abs(vmin) if abs(vmin) > 1e-12 else 1.0
+        pad = base * pad_ratio
+    else:
+        pad = (vmax - vmin) * pad_ratio
+    return vmin - pad, vmax + pad
+
+
 def _plot_1d_scatter(ax, coords, scores, pitches_arr, feat_tuple, is_last_subset):
     """
     绘制 1D 散点图逻辑。x 轴为评分标签 (带抖动)，y 轴为特征值。点的颜色和形状根据音高区分。
@@ -264,16 +283,52 @@ def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
 
     # 2. 遍历特征组合进行绘图
     for feat_tuple in feat_combinations:
-        fig = plt.figure(figsize=FIG_SIZE, dpi=DPI)
+        # 先准备三个子集的数据，后续统一计算坐标轴范围
+        subset_payloads = []
+        for subset_group in SUBSET_GROUPS:
+            df_subset = filter_df_by_subset(df_full, subset_group)
+            df_valid = df_subset.dropna(subset=['score_label'])
+            df_valid = df_valid.dropna(subset=['pitch_digit'])
+            if df_valid.empty:
+                subset_payloads.append(None)
+                continue
+
+            subset_payloads.append({
+                "coords": df_valid[list(feat_tuple)].values,
+                "scores": df_valid['score_label'].values.astype(float),
+                "pitches_arr": df_valid['pitch_digit'].values,
+            })
+
+        valid_payloads = [p for p in subset_payloads if p is not None]
+        shared_xlim = None
+        shared_ylim = None
+        shared_zlim = None
+        if valid_payloads:
+            if ndim == 1:
+                y_all = np.concatenate([p["coords"][:, 0] for p in valid_payloads])
+                shared_ylim = _compute_axis_limits(y_all)
+            elif ndim == 2:
+                x_all = np.concatenate([p["coords"][:, 0] for p in valid_payloads])
+                y_all = np.concatenate([p["coords"][:, 1] for p in valid_payloads])
+                shared_xlim = _compute_axis_limits(x_all)
+                shared_ylim = _compute_axis_limits(y_all)
+            elif ndim == 3:
+                x_all = np.concatenate([p["coords"][:, 0] for p in valid_payloads])
+                y_all = np.concatenate([p["coords"][:, 1] for p in valid_payloads])
+                z_all = np.concatenate([p["coords"][:, 2] for p in valid_payloads])
+                shared_xlim = _compute_axis_limits(x_all)
+                shared_ylim = _compute_axis_limits(y_all)
+                shared_zlim = _compute_axis_limits(z_all)
 
         # 设置子图
         if ndim == 3:
+            fig = plt.figure(figsize=FIG_SIZE, dpi=DPI)
             axes = [fig.add_subplot(1, 3, i + 1, projection='3d')
                     for i in range(3)]
         else:
             # 1D 和 2D 使用普通子图，1D 共享 Y 轴
             sharey = (ndim == 1)
-            _, axes_temp = plt.subplots(1, 3, figsize=FIG_SIZE, sharey=sharey)
+            fig, axes_temp = plt.subplots(1, 3, figsize=FIG_SIZE, dpi=DPI, sharey=sharey)
             if not isinstance(axes_temp, (list, np.ndarray)):
                 axes = [axes_temp]
             else:
@@ -282,21 +337,16 @@ def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
         # 遍历每个子集组 (A+1, B+1, All)
         for i, subset_group in enumerate(SUBSET_GROUPS):
             ax = axes[i]
-            # 筛选当前子集的数据
-            df_subset = filter_df_by_subset(df_full, subset_group)
-
-            # 去除当前子集中 score_label 或 pitch_digit 为 None 的行，确保绘图数据有效
-            df_valid = df_subset.dropna(subset=['score_label'])
-            df_valid = df_valid.dropna(subset=['pitch_digit'])
-            if df_valid.empty:
+            payload = subset_payloads[i]
+            if payload is None:
                 ax.set_axis_off()
                 ax.set_title(f"Subset: {'+'.join(subset_group)} (No Data)")
                 continue
 
             # 提取坐标数据
-            coords = df_valid[list(feat_tuple)].values
-            scores = df_valid['score_label'].values.astype(float)
-            pitches_arr = df_valid['pitch_digit'].values
+            coords = payload["coords"]
+            scores = payload["scores"]
+            pitches_arr = payload["pitches_arr"]
 
             # --- 调用对应的维度绘图逻辑 ---
             if ndim == 1:
@@ -314,18 +364,36 @@ def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
                     ax, coords, scores, feat_tuple
                 )
 
+            # 强制对齐三个子图的坐标轴范围
+            if ndim == 1:
+                ax.set_xlim(0.5, 5.5)
+                if shared_ylim is not None:
+                    ax.set_ylim(*shared_ylim)
+            elif ndim == 2:
+                if shared_xlim is not None:
+                    ax.set_xlim(*shared_xlim)
+                if shared_ylim is not None:
+                    ax.set_ylim(*shared_ylim)
+            elif ndim == 3:
+                if shared_xlim is not None:
+                    ax.set_xlim(*shared_xlim)
+                if shared_ylim is not None:
+                    ax.set_ylim(*shared_ylim)
+                if shared_zlim is not None:
+                    ax.set_zlim(*shared_zlim)
+
             ax.set_title(f"Subset: {'+'.join(subset_group)}", fontsize=12)
             ax.grid(True, linestyle='--', alpha=0.3)
 
         # 设置总标题
         title_suffix = f"{feat_tuple[0]}" if ndim == 1 else f"{', '.join(feat_tuple)}"
-        plt.suptitle(f"{ndim}D Scatter Plot: {title_suffix}", fontsize=16)
-        # plt.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.suptitle(f"{ndim}D Scatter Plot: {title_suffix}", fontsize=16)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
 
         # 保存图像
         filename_safe = "_".join(feat_tuple)
         plot_path = os.path.join(plot_dir, f"scatter_{ndim}d_{filename_safe}.png")
-        plt.savefig(plot_path, dpi=300)
+        fig.savefig(plot_path, dpi=300)
         plt.close(fig)
         # print(f"[+] 已保存图像：{plot_path}")  # 可选：减少控制台输出
 
