@@ -1,5 +1,6 @@
 import os
 import time
+import json
 
 import librosa
 import matplotlib.pyplot as plt
@@ -9,6 +10,137 @@ import parselmouth as pm
 from tqdm import tqdm
 
 from src.data_loader import load_audio, load_feat_series
+
+
+def compute_frame_level_f0_rms(audio, sr, hop_length=512, frame_length=2048):
+    """计算整段 frame-level F0 与 RMS，并做长度对齐。"""
+    if audio is None or len(audio) == 0 or sr <= 0:
+        return None, None, None
+    try:
+        f0, _, _ = librosa.pyin(
+            audio,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"),
+            sr=sr,
+            hop_length=hop_length,
+            frame_length=frame_length,
+        )
+    except Exception as e:
+        print("[!] Error computing frame-level F0:", e)
+        return None, None, None
+    if f0 is None:
+        return None, None, None
+
+    f0 = np.asarray(f0, dtype=np.float32)
+    rms = librosa.feature.rms(
+        y=audio, frame_length=frame_length, hop_length=hop_length, center=True
+    )[0].astype(np.float32)
+    min_len = min(f0.shape[0], rms.shape[0])
+    if min_len <= 0:
+        return None, None, None
+    f0 = f0[:min_len]
+    rms = rms[:min_len]
+    times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
+    return f0, rms, times
+
+
+def find_most_stable_window_by_f0_rms(
+        audio,
+        sr,
+        hop_length=512,
+        frame_length=2048,
+        min_sec=2.0,
+        max_sec=3.0,
+):
+    """
+    根据 F0/RMS 波动寻找最稳定的 2-3 秒窗口。
+    返回 (audio_window, meta_info)。
+    """
+    f0, rms, _times = compute_frame_level_f0_rms(
+        audio, sr, hop_length=hop_length, frame_length=frame_length
+    )
+    if f0 is None or rms is None:
+        return None, None
+
+    valid_mask = np.isfinite(f0) & (f0 > 0) & np.isfinite(rms) & (rms > 0)
+    valid_count = int(np.sum(valid_mask))
+    if valid_count < 5:
+        return None, None
+
+    f0_valid = f0[valid_mask]
+    rms_valid = rms[valid_mask]
+    f0_med = float(np.median(f0_valid))
+    if not np.isfinite(f0_med) or f0_med <= 0:
+        return None, None
+
+    # 将 F0 波动转为 cents、RMS 转为 dB，便于共同建模稳定性。
+    f0_cents = np.full_like(f0, np.nan, dtype=np.float32)
+    f0_cents[valid_mask] = 1200.0 * np.log2(f0[valid_mask] / f0_med)
+    rms_db = np.full_like(rms, np.nan, dtype=np.float32)
+    rms_db[valid_mask] = 20.0 * np.log10(rms[valid_mask] + 1e-12)
+
+    f0_scale = float(np.nanstd(f0_cents[valid_mask]))
+    rms_scale = float(np.nanstd(rms_db[valid_mask]))
+    if not np.isfinite(f0_scale) or f0_scale <= 1e-6:
+        f0_scale = 1.0
+    if not np.isfinite(rms_scale) or rms_scale <= 1e-6:
+        rms_scale = 1.0
+
+    min_frames = max(1, int(np.ceil(min_sec * sr / hop_length)))
+    max_frames = max(min_frames, int(np.floor(max_sec * sr / hop_length)))
+    n_frames = f0.shape[0]
+    if n_frames < min_frames:
+        return None, None
+
+    best = None
+    for win_frames in range(min_frames, max_frames + 1):
+        for start in range(0, n_frames - win_frames + 1):
+            end = start + win_frames
+            win_valid = valid_mask[start:end]
+            voiced_ratio = float(np.mean(win_valid))
+            if voiced_ratio < 0.8:
+                continue
+            seg_f0_cents = f0_cents[start:end][win_valid]
+            seg_rms_db = rms_db[start:end][win_valid]
+            if seg_f0_cents.size < max(5, int(0.8 * win_frames)):
+                continue
+            f0_std = float(np.std(seg_f0_cents))
+            rms_std = float(np.std(seg_rms_db))
+            score = (f0_std / f0_scale) + (rms_std / rms_scale)
+            candidate = (score, -voiced_ratio, win_frames, start, end, f0_std, rms_std)
+            if best is None or candidate < best:
+                best = candidate
+
+    if best is None:
+        return None, None
+
+    _score, neg_voiced_ratio, win_frames, start, end, f0_std, rms_std = best
+    start_sample = int(start * hop_length)
+    end_sample = int(min(len(audio), end * hop_length))
+    if end_sample <= start_sample:
+        return None, None
+    window_audio = audio[start_sample:end_sample]
+    meta = {
+        "start_time_sec": float(start_sample / sr),
+        "end_time_sec": float(end_sample / sr),
+        "duration_sec": float((end_sample - start_sample) / sr),
+        "window_frames": int(win_frames),
+        "voiced_ratio": float(-neg_voiced_ratio),
+        "f0_std_cents": float(f0_std),
+        "rms_std_db": float(rms_std),
+    }
+    return window_audio, meta
+
+
+def save_stable_window_meta(output_dir, wav_filename, meta):
+    """保存稳定段起止时间与稳定性指标。"""
+    meta_dir = os.path.join(output_dir, "_stable_windows")
+    os.makedirs(meta_dir, exist_ok=True)
+    json_name = os.path.splitext(wav_filename)[0] + ".json"
+    json_path = os.path.join(meta_dir, json_name)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return json_path
 
 
 def trim_edge_transients(audio, sr, head_ms=500, tail_ms=500):
@@ -334,7 +466,34 @@ def extract_feats_from_single_wav(
     csv_filename = os.path.splitext(wav_filename)[0] + ".csv"
     png_filename = os.path.splitext(wav_filename)[0] + ".png"
     # 统一去掉起止瞬态：前 500ms、后 500ms
-    audio = trim_edge_transients(audio, sr, head_ms=500, tail_ms=500)
+    head_ms = 500
+    tail_ms = 500
+    audio = trim_edge_transients(audio, sr, head_ms=head_ms, tail_ms=tail_ms)
+    if audio is None or len(audio) == 0:
+        return [("StableWindow", "失败"), ("AllFeatures", "失败")]
+
+    # 计算整段 frame-level F0/RMS，并选取最稳定的 2-3 秒窗口提取参数。
+    stable_audio, stable_meta = find_most_stable_window_by_f0_rms(
+        audio,
+        sr,
+        hop_length=512,
+        frame_length=2048,
+        min_sec=2.0,
+        max_sec=3.0,
+    )
+    if stable_audio is None or stable_meta is None or len(stable_audio) == 0:
+        print(f"[!] {wav_filename} 稳定段提取失败，跳过该文件。")
+        return [("StableWindow", "失败"), ("AllFeatures", "失败")]
+
+    # 记录稳定段在原始输入音频中的时间（考虑前 500ms 裁剪偏移）。
+    stable_meta["start_time_sec_after_trim"] = stable_meta["start_time_sec"]
+    stable_meta["end_time_sec_after_trim"] = stable_meta["end_time_sec"]
+    stable_meta["trim_head_sec"] = float(head_ms / 1000.0)
+    stable_meta["trim_tail_sec"] = float(tail_ms / 1000.0)
+    stable_meta["start_time_sec_in_original"] = stable_meta["start_time_sec"] + float(head_ms / 1000.0)
+    stable_meta["end_time_sec_in_original"] = stable_meta["end_time_sec"] + float(head_ms / 1000.0)
+    save_stable_window_meta(output_dir, wav_filename, stable_meta)
+    audio = stable_audio
 
     targets = [
         ("Jitter", extract_jitter, (audio, sr)),
