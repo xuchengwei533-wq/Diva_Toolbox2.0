@@ -11,6 +11,34 @@ from tqdm import tqdm
 from src.data_loader import load_audio, load_feat_series
 
 
+def trim_edge_transients(audio, sr, head_ms=500, tail_ms=500):
+    """
+    去掉音频起始和结束瞬态：
+    - 默认去掉前 500ms 和后 500ms。
+    - 若长度不足以同时去掉两端，则返回空数组。
+    """
+    if audio is None:
+        return np.array([], dtype=np.float32)
+    audio_arr = np.asarray(audio)
+    if audio_arr.size == 0 or sr <= 0:
+        return np.array([], dtype=np.float32)
+
+    head_samples = int(sr * head_ms / 1000.0)
+    tail_samples = int(sr * tail_ms / 1000.0)
+    total_trim = head_samples + tail_samples
+    if total_trim <= 0:
+        return audio_arr
+
+    if audio_arr.size <= total_trim:
+        print(
+            f"[!] 音频长度不足，无法去掉前{head_ms}ms和后{tail_ms}ms："
+            f"len={audio_arr.size / float(sr):.3f}s"
+        )
+        return np.array([], dtype=np.float32)
+
+    return audio_arr[head_samples: audio_arr.size - tail_samples]
+
+
 def extract_jitter(audio, sr, hop_length=512):
     # 优先使用 parselmouth（Praat 标准实现）
     try:
@@ -133,37 +161,49 @@ def extract_hnr_librosa(audio, sr, frame_length=2048, hop_length=512):
     return hnr
 
 
-def extract_q_values(audio, sr, n_fft=2048, hop_length=512):
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    q_vals = []
-    for t in range(S.shape[1]):
-        mag = S[:, t]
-        if mag.size == 0:
-            continue
-        peak_idx = int(np.argmax(mag))
-        peak_mag = mag[peak_idx]
-        if not np.isfinite(peak_mag) or peak_mag <= 0:
-            continue
-        f0 = freqs[peak_idx]
-        if not np.isfinite(f0) or f0 <= 0:
-            continue
-        target = peak_mag / np.sqrt(2.0)
-        left = peak_idx
-        while left > 0 and mag[left] >= target:
-            left -= 1
-        right = peak_idx
-        while right < len(mag) - 1 and mag[right] >= target:
-            right += 1
-        if left == peak_idx or right == peak_idx:
-            continue
-        bw = freqs[right] - freqs[left]
-        if not np.isfinite(bw) or bw <= 0:
-            continue
-        q_vals.append(float(f0 / bw))
-    if len(q_vals) == 0:
+def extract_q1(audio, sr, n_fft=2048, hop_length=512):
+    """
+    提取标准 Q1：Q1 = F1 / BW1
+    - F1: 第一共振峰中心频率（Hz）
+    - BW1: 第一共振峰带宽（Hz）
+    使用 Praat/Burg formant 估计逐帧计算 Q1 序列。
+    """
+    _ = n_fft  # 兼容旧接口参数，Q1 计算不依赖 STFT FFT 点数
+    try:
+        snd = pm.Sound(audio, sampling_frequency=sr)
+        time_step = hop_length / float(sr) if sr > 0 else 0.01
+        max_formant = min(5500.0, 0.45 * sr)
+        formant_obj = pm.praat.call(
+            snd,
+            "To Formant (burg)",
+            time_step,      # time step
+            5.0,            # max number of formants
+            max_formant,    # max formant (Hz)
+            0.025,          # window length (s)
+            50.0,           # pre-emphasis from (Hz)
+        )
+
+        n_frames = int(pm.praat.call(formant_obj, "Get number of frames"))
+        q1_vals = []
+        for frame_idx in range(1, n_frames + 1):
+            t = pm.praat.call(formant_obj, "Get time from frame number", frame_idx)
+            f1 = pm.praat.call(formant_obj, "Get value at time", 1, t, "Hertz", "Linear")
+            bw1 = pm.praat.call(formant_obj, "Get bandwidth at time", 1, t, "Hertz", "Linear")
+            if not np.isfinite(f1) or not np.isfinite(bw1):
+                continue
+            if f1 <= 0 or bw1 <= 0:
+                continue
+            # 约束在合理语音范围内，减少跟踪异常点
+            if f1 < 100.0 or f1 > 1500.0 or bw1 > 2000.0:
+                continue
+            q1_vals.append(float(f1 / bw1))
+
+        if len(q1_vals) == 0:
+            return None
+        return np.asarray(q1_vals, dtype=np.float32)
+    except Exception as e:
+        print("[!] Error extracting Q1 with parselmouth:", e)
         return None
-    return np.asarray(q_vals, dtype=np.float32)
 
 
 def extract_spectral_slope(audio, sr, hop_length=512, n_fft=2048):
@@ -293,13 +333,15 @@ def extract_feats_from_single_wav(
     """
     csv_filename = os.path.splitext(wav_filename)[0] + ".csv"
     png_filename = os.path.splitext(wav_filename)[0] + ".png"
+    # 统一去掉起止瞬态：前 500ms、后 500ms
+    audio = trim_edge_transients(audio, sr, head_ms=500, tail_ms=500)
 
     targets = [
         ("Jitter", extract_jitter, (audio, sr)),
         ("Shimmer", extract_shimmer, (audio, sr)),
         ("H1H2", extract_h1h2, (audio, sr)),
         ("HNR", extract_hnr, (audio, sr)),
-        ("QValue", extract_q_values, (audio, sr)),
+        ("Q1", extract_q1, (audio, sr)),
         ("SpectralSlope", extract_spectral_slope, (audio, sr)),
         ("LowFreqEnergyRatio", extract_low_freq_energy_ratio, (audio, sr)),
         ("HighFreqNoiseRatio", extract_high_freq_noise_ratio, (audio, sr)),

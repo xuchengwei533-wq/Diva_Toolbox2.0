@@ -20,7 +20,7 @@ acoustic_feats:
   - "Shimmer"
   - "H1H2"
   - "HNR"
-  - "QValue"
+  - "Q1"
   - "SpectralSlope"
   - "LowFreqEnergyRatio"
   - "HighFreqNoiseRatio"
