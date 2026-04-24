@@ -1,1 +1,0 @@
-0.4235*LowFreqEnergyRatio + -0.4178*QValue + -0.4121*CPP + 0.4010*H1H2 + 0.3533*Jitter + 0.3190*Shimmer + -0.2263*HNR + -0.1841*HighFreqNoiseRatio + 0.0609*SpectralSlope

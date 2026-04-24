@@ -28,6 +28,10 @@ MARKER_SIZE = 80
 # 样式映射常量
 PITCH_MARKERS = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h']
 SCORE_COLOR_MAP = {1: 'red', 3: 'green', 5: 'blue'}
+LEGACY_FEATURE_ALIASES = {
+    "QValue": "Q1",
+    "H1H2": "H1H2_output",
+}
 
 
 # ==============================================================================
@@ -106,6 +110,22 @@ def remove_outlier_jitter_df(df: pd.DataFrame, jitter_col: str = "Jitter") -> pd
 
     # 返回删除了该行的副本
     return df.drop(index=max_idx)
+
+
+def normalize_feature_naming(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将历史特征命名映射到当前标准命名，确保绘图流程兼容旧产物。
+    """
+    out = df.copy()
+    for old_name, new_name in LEGACY_FEATURE_ALIASES.items():
+        if old_name not in out.columns:
+            continue
+        if new_name in out.columns:
+            out[new_name] = out[new_name].combine_first(out[old_name])
+            out = out.drop(columns=[old_name])
+        else:
+            out = out.rename(columns={old_name: new_name})
+    return out
 
 
 # ==============================================================================
@@ -239,7 +259,12 @@ def _plot_3d_scatter(ax, coords, scores, feat_tuple):
     ax.legend(handles=handles, title="Score", loc='upper left', fontsize=8)
 
 
-def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
+def plot_scatter_ndim(
+        df_stats: pd.DataFrame,
+        outputs_root: str,
+        ndim: int,
+        feat_names: list = None
+):
     """
     绘制散点图的统一入口函数 (DataFrame 版本)，根据 ndim 参数决定绘制 1D/2D/3D 散点图。
 
@@ -259,6 +284,7 @@ def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
         raise ValueError("ndim 必须为 1, 2 或 3")
 
     # 1. 数据预处理
+    df_stats = normalize_feature_naming(df_stats)
     df_full = enrich_df_with_metadata(df_stats)  # 添加元数据列
     df_full = remove_outlier_jitter_df(df_full)  # 移除 jitter 异常值
     # 检查是否有有效数据
@@ -266,9 +292,16 @@ def plot_scatter_ndim(df_stats: pd.DataFrame, outputs_root: str, ndim: int):
         print("[!] 数据为空，无法绘图。")
         return
 
-    # 提取所有声学特征列名 (排除元数据列)
+    # 提取声学特征列名 (排除元数据列)
     meta_cols = ['score_label', 'subset_type', 'pitch_digit']
-    all_feat_names = [c for c in df_full.columns if c not in meta_cols]
+    available_feat_names = [c for c in df_full.columns if c not in meta_cols]
+    if feat_names:
+        all_feat_names = [f for f in feat_names if f in available_feat_names]
+        missing_feats = [f for f in feat_names if f not in available_feat_names]
+        if missing_feats:
+            print(f"[!] 以下配置特征在统计表中不存在，将跳过绘图：{missing_feats}")
+    else:
+        all_feat_names = available_feat_names
     if not all_feat_names:
         print("[!] 未找到任何特征列。")
         return
@@ -421,5 +454,5 @@ if __name__ == '__main__':
     print("[*] 开始绘制散点图...")
     for ndim in [1, 2, 3]:
         print(f"[*] 绘制 {ndim}D 散点图...")
-        plot_scatter_ndim(df_feats_stats, outputs_root, ndim)
+        plot_scatter_ndim(df_feats_stats, outputs_root, ndim, feat_names=list(acoustic_feats))
     print("[+] 散点图绘制完成！")

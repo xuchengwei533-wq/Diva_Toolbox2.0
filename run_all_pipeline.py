@@ -148,8 +148,9 @@ def run_pipeline(
         log("[*] 跳过评分表合并（无评分文件）。")
 
     log("[*] Step 3/6: scatter plots (1D, 2D, 3D)")
+    feat_names = list(cfg.acoustic_feats) if "acoustic_feats" in cfg else None
     for ndim in [1, 2, 3]:
-        plot_scatter_ndim(df_stats, str(dataset_output_root), ndim)
+        plot_scatter_ndim(df_stats, str(dataset_output_root), ndim, feat_names=feat_names)
 
     if combined is not None:
         log("[*] Step 4/6: LASSO analysis")

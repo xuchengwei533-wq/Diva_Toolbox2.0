@@ -1,0 +1,15 @@
+{
+  "start_time_sec": 1.7182766439909296,
+  "end_time_sec": 3.7384126984126986,
+  "duration_sec": 2.020136054421769,
+  "window_frames": 174,
+  "voiced_ratio": 1.0,
+  "f0_std_cents": 18.912593841552734,
+  "rms_std_db": 0.9668452739715576,
+  "start_time_sec_after_trim": 1.7182766439909296,
+  "end_time_sec_after_trim": 3.7384126984126986,
+  "trim_head_sec": 0.5,
+  "trim_tail_sec": 0.5,
+  "start_time_sec_in_original": 2.2182766439909294,
+  "end_time_sec_in_original": 4.238412698412699
+}
