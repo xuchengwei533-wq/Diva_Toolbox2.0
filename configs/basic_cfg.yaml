@@ -18,7 +18,7 @@ output:
 acoustic_feats:
   - "Jitter"
   - "Shimmer"
-  - "H1H2"
+  - "H1H2_output"
   - "HNR"
   - "Q1"
   - "SpectralSlope"

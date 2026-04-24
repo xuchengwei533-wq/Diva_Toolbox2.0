@@ -215,31 +215,42 @@ def extract_jitter_librosa(audio, sr, hop_length=512):
 
 
 def extract_shimmer(audio, sr, hop_length=512, frame_length=2048):
-    f0, _, _ = librosa.pyin(
-        audio,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7"),
-        sr=sr,
-        hop_length=hop_length,
-    )
-    if f0 is None:
+    """
+    提取 Praat 周期级 Shimmer(local)。
+    说明：保留 hop_length/frame_length 参数以兼容旧接口，但该实现不依赖它们。
+    """
+    _ = hop_length
+    _ = frame_length
+    try:
+        snd = pm.Sound(audio, sampling_frequency=sr)
+        point_process = pm.praat.call(
+            snd, "To PointProcess (periodic, cc)",
+            65.0, 1000.0
+        )
+        shimmer_local = pm.praat.call(
+            [snd, point_process], "Get shimmer (local)",
+            0.0, 0.0,        # from_time, to_time
+            0.0001, 0.02,    # period_floor, period_ceiling
+            1.3, 1.6         # maximum_period_factor, maximum_amplitude_factor
+        )
+        if not np.isfinite(shimmer_local):
+            return None
+        return np.asarray([float(shimmer_local)], dtype=np.float32)
+    except Exception as e:
+        print("[!] Error extracting shimmer(local) with parselmouth:", e)
         return None
-    f0 = np.asarray(f0, dtype=np.float32)
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length, center=True)[0]
-    if rms is None or rms.size == 0:
+
+
+def _local_peak_db(mag, freqs, target_hz, half_window_hz):
+    f_min = max(0.0, target_hz - half_window_hz)
+    f_max = target_hz + half_window_hz
+    idx = np.where((freqs >= f_min) & (freqs <= f_max))[0]
+    if idx.size == 0:
         return None
-    min_len = min(f0.shape[0], rms.shape[0])
-    f0 = f0[:min_len]
-    rms = rms[:min_len]
-    mask = np.isfinite(f0) & (f0 > 0)
-    amp = rms[mask]
-    if amp.size < 2:
+    peak_mag = float(np.max(mag[idx]))
+    if not np.isfinite(peak_mag) or peak_mag <= 0:
         return None
-    diffs = np.abs(np.diff(amp))
-    denom = np.mean(amp)
-    if denom <= 0:
-        return None
-    return diffs / denom
+    return float(20.0 * np.log10(peak_mag + 1e-8))
 
 
 def extract_h1h2(audio, sr, hop_length=512, n_fft=2048):
@@ -254,7 +265,8 @@ def extract_h1h2(audio, sr, hop_length=512, n_fft=2048):
         return None
     f0 = np.asarray(f0, dtype=np.float32)
     S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True))
-    n_bins, n_frames = S.shape
+    _n_bins, n_frames = S.shape
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     min_len = min(f0.shape[0], n_frames)
     f0 = f0[:min_len]
     S = S[:, :min_len]
@@ -263,14 +275,15 @@ def extract_h1h2(audio, sr, hop_length=512, n_fft=2048):
         f0_t = f0[t]
         if not np.isfinite(f0_t) or f0_t <= 0:
             continue
-        bin1 = int(np.round(f0_t * n_fft / sr))
-        bin2 = int(np.round(2.0 * f0_t * n_fft / sr))
-        if bin2 <= 0 or bin2 >= n_bins or bin1 <= 0 or bin1 >= n_bins:
+        if 2.0 * f0_t >= 0.49 * sr:
             continue
-        h1 = S[bin1, t]
-        h2 = S[bin2, t]
-        h1_db = 20.0 * np.log10(h1 + 1e-8)
-        h2_db = 20.0 * np.log10(h2 + 1e-8)
+        mag_t = S[:, t]
+        win1_hz = max(30.0, 0.1 * float(f0_t))
+        win2_hz = max(30.0, 0.1 * float(2.0 * f0_t))
+        h1_db = _local_peak_db(mag_t, freqs, float(f0_t), win1_hz)
+        h2_db = _local_peak_db(mag_t, freqs, float(2.0 * f0_t), win2_hz)
+        if h1_db is None or h2_db is None:
+            continue
         h1h2_vals.append(h1_db - h2_db)
     if len(h1h2_vals) == 0:
         return None
@@ -498,7 +511,7 @@ def extract_feats_from_single_wav(
     targets = [
         ("Jitter", extract_jitter, (audio, sr)),
         ("Shimmer", extract_shimmer, (audio, sr)),
-        ("H1H2", extract_h1h2, (audio, sr)),
+        ("H1H2_output", extract_h1h2, (audio, sr)),
         ("HNR", extract_hnr, (audio, sr)),
         ("Q1", extract_q1, (audio, sr)),
         ("SpectralSlope", extract_spectral_slope, (audio, sr)),

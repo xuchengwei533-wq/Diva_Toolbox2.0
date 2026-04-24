@@ -13,10 +13,11 @@
 1. **特征提取**
    - 在 `Extract/` 中运行相应脚本，生成特征 CSV 文件
    - 每个脚本会在数据目录下创建对应的输出文件夹
-   - 特征包括：Jitter、Shimmer、H1H2、HNR、Q1、SpectralSlope、LowFreqEnergyRatio、HighFreqNoiseRatio、CPP 等
+   - 特征包括：Jitter、Shimmer（Praat shimmer local）、H1H2_output、HNR、Q1、SpectralSlope、LowFreqEnergyRatio、HighFreqNoiseRatio、CPP 等
    - 其中 `Q1` 定义为第一共振峰品质因子（first-formant quality factor）：
      - `Q1 = F1 / BW1`
      - `F1` 为第一共振峰中心频率（Hz），`BW1` 为第一共振峰带宽（Hz）
+   - `H1H2_output` 使用 output-based 计算：在 `F0` 与 `2F0` 附近小频带内搜索局部峰值，再计算 `H1-H2`
 2. **特征组合训练与评估**
    - 运行 `TrainModels.py`
    - 自动枚举可用特征组组合，训练序数回归（LogisticAT）
