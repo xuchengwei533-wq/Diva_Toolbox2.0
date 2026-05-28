@@ -1,6 +1,7 @@
 import os
 import time
 import json
+from typing import Callable, Optional
 
 import librosa
 import matplotlib.pyplot as plt
@@ -49,87 +50,208 @@ def find_most_stable_window_by_f0_rms(
         sr,
         hop_length=512,
         frame_length=2048,
-        min_sec=2.0,
-        max_sec=3.0,
+        min_sec=1.0,
+        max_sec=2.0,
+        fallback_min_sec=0.3,
 ):
     """
-    根据 F0/RMS 波动寻找最稳定的 2-3 秒窗口。
+    根据 F0/RMS 波动寻找最稳定窗口。
+    优先寻找 1-2 秒的稳态段；若音频较短或 F0 不稳定，则逐步放宽条件，
+    并使用连续发声段或高能量窗口作为保底，尽量保证每个非空音频都能返回可分析片段。
     返回 (audio_window, meta_info)。
     """
     f0, rms, _times = compute_frame_level_f0_rms(
         audio, sr, hop_length=hop_length, frame_length=frame_length
     )
     if f0 is None or rms is None:
+        if audio is None or len(audio) == 0 or sr <= 0:
+            return None, None
+        # 如果 F0/RMS 本身无法可靠计算，则直接退化为整段中间片段。
+        fallback_audio = np.asarray(audio, dtype=np.float32)
+        return fallback_audio, {
+            "start_time_sec": 0.0,
+            "end_time_sec": float(len(fallback_audio) / sr),
+            "duration_sec": float(len(fallback_audio) / sr),
+            "window_frames": 0,
+            "voiced_ratio": 0.0,
+            "f0_std_cents": float("nan"),
+            "rms_std_db": float("nan"),
+            "selection_method": "full_audio_fallback",
+        }
+
+    n_frames = f0.shape[0]
+    if n_frames <= 0:
         return None, None
 
     valid_mask = np.isfinite(f0) & (f0 > 0) & np.isfinite(rms) & (rms > 0)
     valid_count = int(np.sum(valid_mask))
-    if valid_count < 5:
-        return None, None
 
-    f0_valid = f0[valid_mask]
-    rms_valid = rms[valid_mask]
-    f0_med = float(np.median(f0_valid))
-    if not np.isfinite(f0_med) or f0_med <= 0:
-        return None, None
+    rms_db_all = np.full_like(rms, np.nan, dtype=np.float32)
+    positive_rms = np.isfinite(rms) & (rms > 0)
+    rms_db_all[positive_rms] = 20.0 * np.log10(rms[positive_rms] + 1e-12)
 
-    # 将 F0 波动转为 cents、RMS 转为 dB，便于共同建模稳定性。
     f0_cents = np.full_like(f0, np.nan, dtype=np.float32)
-    f0_cents[valid_mask] = 1200.0 * np.log2(f0[valid_mask] / f0_med)
-    rms_db = np.full_like(rms, np.nan, dtype=np.float32)
-    rms_db[valid_mask] = 20.0 * np.log10(rms[valid_mask] + 1e-12)
+    if valid_count >= 5:
+        f0_valid = f0[valid_mask]
+        rms_valid = rms_db_all[valid_mask]
+        f0_med = float(np.median(f0_valid))
+        if np.isfinite(f0_med) and f0_med > 0:
+            f0_cents[valid_mask] = 1200.0 * np.log2(f0[valid_mask] / f0_med)
+        f0_scale = float(np.nanstd(f0_cents[valid_mask]))
+        rms_scale = float(np.nanstd(rms_valid))
+    else:
+        f0_scale = float("nan")
+        rms_scale = float(np.nanstd(rms_db_all[positive_rms])) if np.any(positive_rms) else float("nan")
 
-    f0_scale = float(np.nanstd(f0_cents[valid_mask]))
-    rms_scale = float(np.nanstd(rms_db[valid_mask]))
     if not np.isfinite(f0_scale) or f0_scale <= 1e-6:
         f0_scale = 1.0
     if not np.isfinite(rms_scale) or rms_scale <= 1e-6:
         rms_scale = 1.0
 
-    min_frames = max(1, int(np.ceil(min_sec * sr / hop_length)))
-    max_frames = max(min_frames, int(np.floor(max_sec * sr / hop_length)))
-    n_frames = f0.shape[0]
+    min_frames_pref = max(5, int(np.ceil(min_sec * sr / hop_length)))
+    max_frames_pref = max(min_frames_pref, int(np.floor(max_sec * sr / hop_length)))
+    fallback_min_frames = max(5, int(np.ceil(fallback_min_sec * sr / hop_length)))
+    max_frames = min(n_frames, max_frames_pref)
+    if max_frames <= 0:
+        max_frames = n_frames
+    min_frames = min(max_frames, min_frames_pref)
+    fallback_frames = min(max_frames, fallback_min_frames)
     if n_frames < min_frames:
-        return None, None
+        min_frames = max_frames
+    if fallback_frames <= 0:
+        fallback_frames = max_frames
 
-    best = None
-    for win_frames in range(min_frames, max_frames + 1):
-        for start in range(0, n_frames - win_frames + 1):
-            end = start + win_frames
-            win_valid = valid_mask[start:end]
-            voiced_ratio = float(np.mean(win_valid))
-            if voiced_ratio < 0.8:
-                continue
-            seg_f0_cents = f0_cents[start:end][win_valid]
-            seg_rms_db = rms_db[start:end][win_valid]
-            if seg_f0_cents.size < max(5, int(0.8 * win_frames)):
-                continue
-            f0_std = float(np.std(seg_f0_cents))
-            rms_std = float(np.std(seg_rms_db))
-            score = (f0_std / f0_scale) + (rms_std / rms_scale)
-            candidate = (score, -voiced_ratio, win_frames, start, end, f0_std, rms_std)
-            if best is None or candidate < best:
-                best = candidate
+    def build_meta(start_frame, end_frame, voiced_ratio, f0_std, rms_std, method):
+        start_sample = int(start_frame * hop_length)
+        end_sample = int(min(len(audio), end_frame * hop_length))
+        if end_sample <= start_sample:
+            end_sample = min(len(audio), start_sample + max(1, hop_length))
+        if end_sample <= start_sample:
+            return None, None
+        window_audio = np.asarray(audio[start_sample:end_sample], dtype=np.float32)
+        if window_audio.size == 0:
+            return None, None
+        meta = {
+            "start_time_sec": float(start_sample / sr),
+            "end_time_sec": float(end_sample / sr),
+            "duration_sec": float((end_sample - start_sample) / sr),
+            "window_frames": int(end_frame - start_frame),
+            "voiced_ratio": float(voiced_ratio),
+            "f0_std_cents": float(f0_std) if np.isfinite(f0_std) else float("nan"),
+            "rms_std_db": float(rms_std) if np.isfinite(rms_std) else float("nan"),
+            "selection_method": method,
+        }
+        return window_audio, meta
 
-    if best is None:
-        return None, None
+    def try_scored_search():
+        best = None
+        for voiced_threshold in [0.8, 0.6, 0.4, 0.2, 0.0]:
+            for win_frames in range(max_frames, fallback_frames - 1, -1):
+                for start in range(0, n_frames - win_frames + 1):
+                    end = start + win_frames
+                    win_valid = valid_mask[start:end]
+                    voiced_ratio = float(np.mean(win_valid))
+                    if voiced_ratio < voiced_threshold:
+                        continue
+                    seg_rms_db = rms_db_all[start:end]
+                    seg_rms_db_valid = seg_rms_db[np.isfinite(seg_rms_db)]
+                    if seg_rms_db_valid.size < max(3, int(np.ceil(max(voiced_threshold, 0.2) * win_frames))):
+                        continue
 
-    _score, neg_voiced_ratio, win_frames, start, end, f0_std, rms_std = best
-    start_sample = int(start * hop_length)
-    end_sample = int(min(len(audio), end * hop_length))
-    if end_sample <= start_sample:
-        return None, None
-    window_audio = audio[start_sample:end_sample]
-    meta = {
-        "start_time_sec": float(start_sample / sr),
-        "end_time_sec": float(end_sample / sr),
-        "duration_sec": float((end_sample - start_sample) / sr),
-        "window_frames": int(win_frames),
-        "voiced_ratio": float(-neg_voiced_ratio),
-        "f0_std_cents": float(f0_std),
-        "rms_std_db": float(rms_std),
-    }
-    return window_audio, meta
+                    seg_f0_cents = f0_cents[start:end][win_valid]
+                    f0_std = float(np.std(seg_f0_cents)) if seg_f0_cents.size >= 3 else float("nan")
+                    rms_std = float(np.std(seg_rms_db_valid))
+                    f0_term = (f0_std / f0_scale) if np.isfinite(f0_std) else 2.0
+                    rms_term = rms_std / rms_scale
+                    duration_bonus = 0.05 * ((max_frames - win_frames) / max(max_frames, 1))
+                    score = f0_term + rms_term + duration_bonus
+                    candidate = (score, -voiced_ratio, -win_frames, start, end, f0_std, rms_std, voiced_threshold)
+                    if best is None or candidate < best:
+                        best = candidate
+            if best is not None:
+                break
+        return best
+
+    best = try_scored_search()
+    if best is not None:
+        _score, neg_voiced_ratio, neg_win_frames, start, end, f0_std, rms_std, voiced_threshold = best
+        return build_meta(
+            start,
+            end,
+            -neg_voiced_ratio,
+            f0_std,
+            rms_std,
+            f"scored_search_thr_{voiced_threshold:.1f}",
+        )
+
+    if valid_count > 0:
+        # 保底 1：使用最长连续发声区，并在需要时向两侧略做扩展。
+        best_run = None
+        run_start = None
+        for idx, is_valid in enumerate(valid_mask):
+            if is_valid and run_start is None:
+                run_start = idx
+            elif not is_valid and run_start is not None:
+                candidate = (idx - run_start, run_start, idx)
+                if best_run is None or candidate[0] > best_run[0]:
+                    best_run = candidate
+                run_start = None
+        if run_start is not None:
+            candidate = (n_frames - run_start, run_start, n_frames)
+            if best_run is None or candidate[0] > best_run[0]:
+                best_run = candidate
+
+        if best_run is not None:
+            run_len, run_start, run_end = best_run
+            target_len = min(max_frames, max(run_len, fallback_frames))
+            center = (run_start + run_end) // 2
+            start = max(0, center - target_len // 2)
+            end = min(n_frames, start + target_len)
+            start = max(0, end - target_len)
+            seg_valid = valid_mask[start:end]
+            seg_f0_cents = f0_cents[start:end][seg_valid]
+            seg_rms_db_valid = rms_db_all[start:end][np.isfinite(rms_db_all[start:end])]
+            f0_std = float(np.std(seg_f0_cents)) if seg_f0_cents.size >= 3 else float("nan")
+            rms_std = float(np.std(seg_rms_db_valid)) if seg_rms_db_valid.size >= 3 else float("nan")
+            return build_meta(
+                start,
+                end,
+                float(np.mean(seg_valid)) if seg_valid.size else 0.0,
+                f0_std,
+                rms_std,
+                "longest_voiced_fallback",
+            )
+
+    # 保底 2：没有可靠 F0 时，直接选择高能量窗口。
+    target_len = min(n_frames, max(fallback_frames, min(max_frames, int(np.ceil(min(1.0, len(audio) / float(sr)) * sr / hop_length)))))
+    target_len = max(1, target_len)
+    best_energy = None
+    for start in range(0, n_frames - target_len + 1):
+        end = start + target_len
+        seg_rms = rms[start:end]
+        finite_seg_rms = seg_rms[np.isfinite(seg_rms)]
+        if finite_seg_rms.size == 0:
+            continue
+        mean_rms = float(np.mean(finite_seg_rms))
+        candidate = (-mean_rms, start, end)
+        if best_energy is None or candidate < best_energy:
+            best_energy = candidate
+
+    if best_energy is not None:
+        _neg_rms, start, end = best_energy
+        seg_valid = valid_mask[start:end]
+        seg_rms_db_valid = rms_db_all[start:end][np.isfinite(rms_db_all[start:end])]
+        rms_std = float(np.std(seg_rms_db_valid)) if seg_rms_db_valid.size >= 3 else float("nan")
+        return build_meta(
+            start,
+            end,
+            float(np.mean(seg_valid)) if seg_valid.size else 0.0,
+            float("nan"),
+            rms_std,
+            "rms_fallback",
+        )
+
+    return build_meta(0, n_frames, 0.0, float("nan"), float("nan"), "full_signal_last_resort")
 
 
 def save_stable_window_meta(output_dir, wav_filename, meta):
@@ -143,32 +265,41 @@ def save_stable_window_meta(output_dir, wav_filename, meta):
     return json_path
 
 
-def trim_edge_transients(audio, sr, head_ms=500, tail_ms=500):
+def trim_edge_transients(audio, sr, head_ms=500, tail_ms=500, return_offsets=False):
     """
     去掉音频起始和结束瞬态：
-    - 默认去掉前 500ms 和后 500ms。
-    - 若长度不足以同时去掉两端，则返回空数组。
+    - 默认最多去掉前 500ms 和后 500ms。
+    - 对短音频使用比例裁剪，避免一刀切导致无可分析内容。
     """
     if audio is None:
-        return np.array([], dtype=np.float32)
+        empty = np.array([], dtype=np.float32)
+        return (empty, 0, 0) if return_offsets else empty
     audio_arr = np.asarray(audio)
     if audio_arr.size == 0 or sr <= 0:
-        return np.array([], dtype=np.float32)
+        empty = np.array([], dtype=np.float32)
+        return (empty, 0, 0) if return_offsets else empty
 
     head_samples = int(sr * head_ms / 1000.0)
     tail_samples = int(sr * tail_ms / 1000.0)
+    max_edge_trim = int(audio_arr.size * 0.15)
+    head_samples = min(head_samples, max_edge_trim)
+    tail_samples = min(tail_samples, max_edge_trim)
+    min_keep_samples = max(1, int(sr * 0.3))
     total_trim = head_samples + tail_samples
     if total_trim <= 0:
-        return audio_arr
+        return (audio_arr, 0, 0) if return_offsets else audio_arr
 
-    if audio_arr.size <= total_trim:
-        print(
-            f"[!] 音频长度不足，无法去掉前{head_ms}ms和后{tail_ms}ms："
-            f"len={audio_arr.size / float(sr):.3f}s"
-        )
-        return np.array([], dtype=np.float32)
+    if audio_arr.size - total_trim < min_keep_samples:
+        total_trim = max(0, audio_arr.size - min_keep_samples)
+        head_samples = min(head_samples, total_trim // 2)
+        tail_samples = min(tail_samples, total_trim - head_samples)
 
-    return audio_arr[head_samples: audio_arr.size - tail_samples]
+    if audio_arr.size <= head_samples + tail_samples:
+        trimmed = audio_arr.astype(np.float32, copy=True)
+        return (trimmed, 0, 0) if return_offsets else trimmed
+
+    trimmed = audio_arr[head_samples: audio_arr.size - tail_samples]
+    return (trimmed, head_samples, tail_samples) if return_offsets else trimmed
 
 
 def extract_jitter(audio, sr, hop_length=512):
@@ -478,33 +609,37 @@ def extract_feats_from_single_wav(
     """
     csv_filename = os.path.splitext(wav_filename)[0] + ".csv"
     png_filename = os.path.splitext(wav_filename)[0] + ".png"
-    # 统一去掉起止瞬态：前 500ms、后 500ms
+    # 统一弱化起止瞬态，但对短音频采用自适应裁剪而不是固定硬切。
     head_ms = 500
     tail_ms = 500
-    audio = trim_edge_transients(audio, sr, head_ms=head_ms, tail_ms=tail_ms)
+    audio, head_trim_samples, tail_trim_samples = trim_edge_transients(
+        audio, sr, head_ms=head_ms, tail_ms=tail_ms, return_offsets=True
+    )
     if audio is None or len(audio) == 0:
         return [("StableWindow", "失败"), ("AllFeatures", "失败")]
 
-    # 计算整段 frame-level F0/RMS，并选取最稳定的 2-3 秒窗口提取参数。
+    # 计算整段 frame-level F0/RMS，并优先选取 1-2 秒的稳态窗口；
+    # 对短音频逐步放宽条件，确保尽量为每条音频返回一个可分析片段。
     stable_audio, stable_meta = find_most_stable_window_by_f0_rms(
         audio,
         sr,
         hop_length=512,
         frame_length=2048,
-        min_sec=2.0,
-        max_sec=3.0,
+        min_sec=1.0,
+        max_sec=2.0,
+        fallback_min_sec=0.3,
     )
     if stable_audio is None or stable_meta is None or len(stable_audio) == 0:
         print(f"[!] {wav_filename} 稳定段提取失败，跳过该文件。")
         return [("StableWindow", "失败"), ("AllFeatures", "失败")]
 
-    # 记录稳定段在原始输入音频中的时间（考虑前 500ms 裁剪偏移）。
+    # 记录稳定段在原始输入音频中的时间，并保存自适应裁剪后的实际偏移量。
     stable_meta["start_time_sec_after_trim"] = stable_meta["start_time_sec"]
     stable_meta["end_time_sec_after_trim"] = stable_meta["end_time_sec"]
-    stable_meta["trim_head_sec"] = float(head_ms / 1000.0)
-    stable_meta["trim_tail_sec"] = float(tail_ms / 1000.0)
-    stable_meta["start_time_sec_in_original"] = stable_meta["start_time_sec"] + float(head_ms / 1000.0)
-    stable_meta["end_time_sec_in_original"] = stable_meta["end_time_sec"] + float(head_ms / 1000.0)
+    stable_meta["trim_head_sec"] = float(head_trim_samples / sr)
+    stable_meta["trim_tail_sec"] = float(tail_trim_samples / sr)
+    stable_meta["start_time_sec_in_original"] = stable_meta["start_time_sec"] + float(head_trim_samples / sr)
+    stable_meta["end_time_sec_in_original"] = stable_meta["end_time_sec"] + float(head_trim_samples / sr)
     save_stable_window_meta(output_dir, wav_filename, stable_meta)
     audio = stable_audio
 
@@ -550,15 +685,18 @@ def extract_feats_from_wav_dir(
         wav_dir,
         output_dir,
         visualize=False,
-        overwrite=False
+        overwrite=False,
+        progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
 ):
     """
     从指定目录下的所有 WAV 文件中提取声乐特征，并保存为 CSV 文件。
     每个 WAV 文件的每个声学特征对应一个 CSV 文件，保存在 output_dir 下的对应特征子目录中。
     """
+    logger = log_callback if log_callback is not None else print
     # 输入准备
     if not os.path.isdir(wav_dir):
-        print(f"[!] Directory not found: {wav_dir}")
+        logger(f"[!] Directory not found: {wav_dir}")
         return
     wav_fullpaths = []
     for root, _dirs, files in os.walk(wav_dir):
@@ -566,15 +704,17 @@ def extract_feats_from_wav_dir(
             if f.lower().endswith(".wav"):
                 wav_fullpaths.append(os.path.join(root, f))
     wav_fullpaths = sorted(wav_fullpaths)
-    print(f"[*] 在目录 {wav_dir}（含子目录）中发现 {len(wav_fullpaths)} 个 WAV 文件，准备提取特征...")
+    logger(f"[*] 在目录 {wav_dir}（含子目录）中发现 {len(wav_fullpaths)} 个 WAV 文件，准备提取特征...")
     if len(wav_fullpaths) == 0:
-        print("[!] 未发现 WAV 文件，提取结束。")
+        logger("[!] 未发现 WAV 文件，提取结束。")
         return
 
     # 输出准备
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    print(f"[*] 提取的特征将保存在目录 {output_dir} 下的对应子目录中。")
+    logger(f"[*] 提取的特征将保存在目录 {output_dir} 下的对应子目录中。")
+    if progress_callback is not None:
+        progress_callback(0, len(wav_fullpaths), "", "准备开始")
 
     # 遍历 WAV 文件，提取特征
     pbar = tqdm(
@@ -598,8 +738,12 @@ def extract_feats_from_wav_dir(
         # 更新进度条和日志
         status = ",".join([f"{k}:{v}" for k, v in results])
         pbar.set_postfix({"步骤": f"{cost_s:.1f}s", "文件": rel_path})
-        tqdm.write(f"[{idx}/{len(wav_fullpaths)}] {rel_path} | {status}")
-    print("[+] 所有文件的特征提取已完成！")
+        if log_callback is None:
+            tqdm.write(f"[{idx}/{len(wav_fullpaths)}] {rel_path} | {status}")
+        logger(f"[{idx}/{len(wav_fullpaths)}] {rel_path} | {status}")
+        if progress_callback is not None:
+            progress_callback(idx, len(wav_fullpaths), rel_path, status)
+    logger("[+] 所有文件的特征提取已完成！")
 
 
 def extract_feats_stats_from_csv(raw_feats_dir, output_dir=None) -> pd.DataFrame:
