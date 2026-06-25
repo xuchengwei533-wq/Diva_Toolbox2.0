@@ -385,40 +385,40 @@ def _local_peak_db(mag, freqs, target_hz, half_window_hz):
 
 
 def extract_h1h2(audio, sr, hop_length=512, n_fft=2048):
-    f0, _, _ = librosa.pyin(
-        audio,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7"),
-        sr=sr,
-        hop_length=hop_length,
-    )
-    if f0 is None:
+    _ = hop_length
+    try:
+        snd = pm.Sound(audio, sampling_frequency=sr)
+        pitch = snd.to_pitch(
+            time_step=0.01,
+            pitch_floor=65.0,
+            pitch_ceiling=2093.0,
+        )
+        f0_values = pitch.selected_array["frequency"]
+        f0_values = f0_values[np.isfinite(f0_values) & (f0_values > 0)]
+        if f0_values.size == 0:
+            return None
+        f0_med = float(np.median(f0_values))
+    except Exception as e:
+        print("[!] Error estimating F0 for H1H2:", e)
         return None
-    f0 = np.asarray(f0, dtype=np.float32)
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True))
-    _n_bins, n_frames = S.shape
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    min_len = min(f0.shape[0], n_frames)
-    f0 = f0[:min_len]
-    S = S[:, :min_len]
-    h1h2_vals = []
-    for t in range(min_len):
-        f0_t = f0[t]
-        if not np.isfinite(f0_t) or f0_t <= 0:
-            continue
-        if 2.0 * f0_t >= 0.49 * sr:
-            continue
-        mag_t = S[:, t]
-        win1_hz = max(30.0, 0.1 * float(f0_t))
-        win2_hz = max(30.0, 0.1 * float(2.0 * f0_t))
-        h1_db = _local_peak_db(mag_t, freqs, float(f0_t), win1_hz)
-        h2_db = _local_peak_db(mag_t, freqs, float(2.0 * f0_t), win2_hz)
-        if h1_db is None or h2_db is None:
-            continue
-        h1h2_vals.append(h1_db - h2_db)
-    if len(h1h2_vals) == 0:
+
+    if not np.isfinite(f0_med) or f0_med <= 0 or 2.0 * f0_med >= 0.49 * sr:
         return None
-    return np.asarray(h1h2_vals, dtype=np.float32)
+    audio_arr = np.asarray(audio, dtype=np.float32)
+    if audio_arr.size < 16:
+        return None
+    audio_arr = audio_arr - float(np.mean(audio_arr))
+    fft_size = int(2 ** np.ceil(np.log2(max(int(n_fft), audio_arr.size))))
+    window = np.hanning(audio_arr.size).astype(np.float32)
+    mag = np.abs(np.fft.rfft(audio_arr * window, n=fft_size))
+    freqs = np.fft.rfftfreq(fft_size, d=1.0 / float(sr))
+    win1_hz = max(30.0, 0.1 * f0_med)
+    win2_hz = max(30.0, 0.2 * f0_med)
+    h1_db = _local_peak_db(mag, freqs, f0_med, win1_hz)
+    h2_db = _local_peak_db(mag, freqs, 2.0 * f0_med, win2_hz)
+    if h1_db is None or h2_db is None:
+        return None
+    return np.asarray([h1_db - h2_db], dtype=np.float32)
 
 
 def extract_hnr(audio, sr, frame_length=2048, hop_length=512):
@@ -482,72 +482,81 @@ def extract_q1(audio, sr, n_fft=2048, hop_length=512):
         return None
 
 
+def _window_spectrum(audio, sr, n_fft=2048):
+    audio_arr = np.asarray(audio, dtype=np.float32)
+    if audio_arr.size < 16 or sr <= 0:
+        return None, None
+    audio_arr = audio_arr - float(np.mean(audio_arr))
+    fft_size = int(2 ** np.ceil(np.log2(max(int(n_fft), audio_arr.size))))
+    window = np.hanning(audio_arr.size).astype(np.float32)
+    mag = np.abs(np.fft.rfft(audio_arr * window, n=fft_size))
+    freqs = np.fft.rfftfreq(fft_size, d=1.0 / float(sr))
+    return mag.astype(np.float64), freqs.astype(np.float64)
+
+
 def extract_spectral_slope(audio, sr, hop_length=512, n_fft=2048):
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True))
-    if S is None or S.size == 0:
+    _ = hop_length
+    mag, freqs = _window_spectrum(audio, sr, n_fft=n_fft)
+    if mag is None:
         return None
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    slopes = []
-    for t in range(S.shape[1]):
-        mag = S[:, t]
-        log_mag = np.log10(mag + 1e-8)
-        slope = np.polyfit(freqs, log_mag, 1)[0]
-        slopes.append(slope)
-    if len(slopes) == 0:
+    mask = (freqs >= 80.0) & (freqs <= min(8000.0, 0.45 * sr)) & np.isfinite(mag)
+    if np.count_nonzero(mask) < 3:
         return None
-    return np.asarray(slopes, dtype=np.float32)
+    log_mag = np.log10(mag[mask] + 1e-8)
+    slope = np.polyfit(freqs[mask], log_mag, 1)[0]
+    if not np.isfinite(slope):
+        return None
+    return np.asarray([slope], dtype=np.float32)
 
 
 def extract_low_freq_energy_ratio(audio, sr, hop_length=512, n_fft=2048):
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True)) ** 2
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    _ = hop_length
+    mag, freqs = _window_spectrum(audio, sr, n_fft=n_fft)
+    if mag is None:
+        return None
+    power = mag ** 2
     low_mask = (freqs >= 0) & (freqs <= 500)
     total_mask = (freqs >= 0) & (freqs <= 1000)
-    low_energy = np.sum(S[low_mask, :], axis=0)
-    total_energy = np.sum(S[total_mask, :], axis=0)
-    ratio = low_energy / (total_energy + 1e-12)
-    ratio = ratio[np.isfinite(ratio)]
-    if ratio.size == 0:
+    total = float(np.sum(power[total_mask]))
+    if total <= 0 or not np.isfinite(total):
         return None
-    return ratio.astype(np.float32)
+    ratio = float(np.sum(power[low_mask]) / (total + 1e-12))
+    return np.asarray([ratio], dtype=np.float32)
 
 
 def extract_high_freq_noise_ratio(audio, sr, hop_length=512, n_fft=2048):
-    harmonic = librosa.effects.harmonic(audio)
-    noise = audio - harmonic
-    S = np.abs(librosa.stft(noise, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True)) ** 2
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    _ = hop_length
+    mag, freqs = _window_spectrum(audio, sr, n_fft=n_fft)
+    if mag is None:
+        return None
+    power = mag ** 2
     high_min = min(4000.0, 0.45 * sr)
     high_mask = freqs >= high_min
-    high_energy = np.sum(S[high_mask, :], axis=0)
-    total_energy = np.sum(S, axis=0)
-    ratio = high_energy / (total_energy + 1e-12)
-    ratio = ratio[np.isfinite(ratio)]
-    if ratio.size == 0:
+    total = float(np.sum(power))
+    if total <= 0 or not np.isfinite(total):
         return None
-    return ratio.astype(np.float32)
+    ratio = float(np.sum(power[high_mask]) / (total + 1e-12))
+    return np.asarray([ratio], dtype=np.float32)
 
 
 def extract_cpp(audio, sr, hop_length=512, n_fft=2048):
-    S = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft, center=True))
-    if S is None or S.size == 0:
+    _ = hop_length
+    mag, _freqs = _window_spectrum(audio, sr, n_fft=n_fft)
+    if mag is None:
         return None
-    log_mag = np.log(S + 1e-8)
-    cepstra = np.fft.irfft(log_mag, axis=0)
-    quef = np.arange(cepstra.shape[0]) / float(sr)
+    log_mag = np.log(mag + 1e-8)
+    cep = np.fft.irfft(log_mag)
+    quef = np.arange(cep.shape[0]) / float(sr)
     qmin = 1.0 / 400.0
     qmax = 1.0 / 60.0
     mask = (quef >= qmin) & (quef <= qmax)
     if not np.any(mask):
         return None
-    cep_range = cepstra[mask, :]
-    peak = np.max(cep_range, axis=0)
-    baseline = np.mean(cep_range, axis=0)
-    cpp = peak - baseline
-    cpp = cpp[np.isfinite(cpp)]
-    if cpp.size == 0:
+    cep_range = cep[mask]
+    cpp = float(np.max(cep_range) - np.mean(cep_range))
+    if not np.isfinite(cpp):
         return None
-    return cpp.astype(np.float32)
+    return np.asarray([cpp], dtype=np.float32)
 
 
 def save_feat_series(out_dir, name, series):
@@ -620,20 +629,37 @@ def extract_feats_from_single_wav(
 
     # 计算整段 frame-level F0/RMS，并优先选取 1-2 秒的稳态窗口；
     # 对短音频逐步放宽条件，确保尽量为每条音频返回一个可分析片段。
-    stable_audio, stable_meta = find_most_stable_window_by_f0_rms(
-        audio,
-        sr,
-        hop_length=512,
-        frame_length=2048,
-        min_sec=1.0,
-        max_sec=2.0,
-        fallback_min_sec=0.3,
-    )
+    if len(audio) > int(6.0 * sr):
+        target_samples = max(1, int(2.0 * sr))
+        stable_start_samples = max(0, len(audio) // 2 - target_samples // 2)
+        stable_end_samples = min(len(audio), stable_start_samples + target_samples)
+        stable_audio = np.asarray(audio[stable_start_samples:stable_end_samples], dtype=np.float32)
+        stable_meta = {
+            "start_time_sec": float(stable_start_samples / sr),
+            "end_time_sec": float(stable_end_samples / sr),
+            "duration_sec": float((stable_end_samples - stable_start_samples) / sr),
+            "window_frames": 0,
+            "voiced_ratio": float("nan"),
+            "f0_std_cents": float("nan"),
+            "rms_std_db": float("nan"),
+            "selection_method": "center_2s_long_audio",
+        }
+    else:
+        stable_audio, stable_meta = find_most_stable_window_by_f0_rms(
+            audio,
+            sr,
+            hop_length=512,
+            frame_length=2048,
+            min_sec=1.0,
+            max_sec=2.0,
+            fallback_min_sec=0.3,
+        )
     if stable_audio is None or stable_meta is None or len(stable_audio) == 0:
         print(f"[!] {wav_filename} 稳定段提取失败，跳过该文件。")
         return [("StableWindow", "失败"), ("AllFeatures", "失败")]
 
     # 记录稳定段在原始输入音频中的时间，并保存自适应裁剪后的实际偏移量。
+
     stable_meta["start_time_sec_after_trim"] = stable_meta["start_time_sec"]
     stable_meta["end_time_sec_after_trim"] = stable_meta["end_time_sec"]
     stable_meta["trim_head_sec"] = float(head_trim_samples / sr)

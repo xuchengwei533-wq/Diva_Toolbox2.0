@@ -23,7 +23,6 @@ acoustic_feats:
   - "Q1"
   - "SpectralSlope"
   - "LowFreqEnergyRatio"
-  - "HighFreqNoiseRatio"
   - "CPP"
 
 vocal_techs:

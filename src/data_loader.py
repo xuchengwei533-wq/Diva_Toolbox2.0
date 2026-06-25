@@ -11,26 +11,40 @@ def list_wav_files(dataset_dir):
     wav_files = []
     for root, dirs, files in os.walk(dataset_dir):
         for file in files:
-            if file.lower().endswith('.wav'):
+            if file.lower().endswith(('.wav', '.m4a', '.mp3', '.flac')):
                 wav_files.append(os.path.join(root, file))
     wav_files.sort()
     return wav_files
 
 
 def load_wav_file(file_path):
-    # audio_raw, sr = librosa.load(file_path, sr=None, mono=True)
-    audio, sr = sf.read(file_path, dtype="float32", always_2d=False)
+    try:
+        audio, sr = sf.read(file_path, dtype="float32", always_2d=False)
+    except Exception:
+        audio, sr = librosa.load(file_path, sr=None, mono=True)
+        audio = np.asarray(audio, dtype=np.float32)
     if hasattr(audio, "ndim") and audio.ndim > 1:
         audio = np.mean(audio, axis=1)
     return audio, sr
 
 
 def preprocess_audio(audio, sr, target_sr=44100):
-    # 重采样
     if sr != target_sr:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-    # 修剪静音
-    audio, _ = librosa.effects.trim(audio, top_db=30)
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return audio, target_sr
+
+    peak = float(np.max(np.abs(audio)))
+    if peak > 0:
+        threshold = peak * (10 ** (-30.0 / 20.0))
+        active = np.flatnonzero(np.abs(audio) > threshold)
+        if active.size > 0:
+            pad = int(0.05 * target_sr)
+            start = max(0, int(active[0]) - pad)
+            end = min(audio.size, int(active[-1]) + pad)
+            if end > start:
+                audio = audio[start:end]
     return audio, target_sr
 
 

@@ -14,6 +14,183 @@ from statsmodels.miscmodels.ordinal_model import OrderedModel
 from src.combined_data import CombinedData
 
 
+FEATURE_DISPLAY_NAMES = {
+    "H1H2_output": "H1H2 (dB)",
+    "H1H2": "H1H2 (dB)",
+    "CPP": "CPP (dB)",
+    "Q1": "Q1 (dimensionless)",
+    "QValue": "Q1 (dimensionless)",
+    "HNR": "HNR (dB)",
+    "SpectralSlope": "Spectral slope",
+    "LowFreqEnergyRatio": "Low-frequency energy ratio",
+    "HighFreqNoiseRatio": "HF residual-noise ratio",
+    "Jitter": "Jitter",
+    "Shimmer": "Shimmer",
+}
+
+
+def _display_feature_name(feature: str) -> str:
+    return FEATURE_DISPLAY_NAMES.get(feature, feature)
+
+
+SUBSET_DISPLAY_NAMES = {
+    ("A", "1"): "Pressed phonation",
+    ("B", "1"): "Breathy phonation",
+    ("A", "B", "1"): "ALL",
+}
+SUBSET_OUTPUT_NAMES = {
+    ("A", "1"): "Pressed_phonation",
+    ("B", "1"): "Breathy_phonation",
+    ("A", "B", "1"): "ALL",
+}
+
+
+def _display_subset_name(subset_types: Optional[List[str]]) -> str:
+    subset_types = subset_types if subset_types else ["A", "B", "1"]
+    return SUBSET_DISPLAY_NAMES.get(tuple(subset_types), "+".join(subset_types))
+
+
+def _subset_output_name(subset_types: Optional[List[str]]) -> str:
+    subset_types = subset_types if subset_types else ["A", "B", "1"]
+    return SUBSET_OUTPUT_NAMES.get(tuple(subset_types), "_".join(subset_types))
+
+
+def _effective_lasso_cv_folds(n_samples: int) -> int:
+    return max(2, min(5, int(n_samples)))
+
+
+def _fit_lasso_cv_coefficients(X: np.ndarray, y: np.ndarray, random_state: int = 42):
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+    model = LassoCV(
+        cv=_effective_lasso_cv_folds(len(y)),
+        random_state=random_state,
+        alphas=100,
+        max_iter=10000,
+    )
+    model.fit(Xz, y)
+    return model.coef_, model.alpha_
+
+
+def _stratified_bootstrap_indices(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    indices = []
+    for value in sorted(np.unique(y)):
+        group_idx = np.flatnonzero(y == value)
+        if group_idx.size == 0:
+            continue
+        indices.append(rng.choice(group_idx, size=group_idx.size, replace=True))
+    if not indices:
+        return np.array([], dtype=int)
+    return rng.permutation(np.concatenate(indices))
+
+
+def _lasso_bootstrap_stability(
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_cols: List[str],
+        n_bootstrap: int = 200,
+        coef_threshold: float = 0.01,
+        random_state: int = 42,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(random_state)
+    coef_rows = []
+    for i in range(n_bootstrap):
+        sample_idx = _stratified_bootstrap_indices(y, rng)
+        if sample_idx.size < 2:
+            continue
+        try:
+            coefs, alpha = _fit_lasso_cv_coefficients(X[sample_idx], y[sample_idx], random_state=random_state + i + 1)
+        except Exception:
+            continue
+        for feature, coef in zip(feature_cols, coefs):
+            coef_rows.append(
+                {
+                    "bootstrap": i + 1,
+                    "feature": feature,
+                    "coef": float(coef),
+                    "abs_coef": float(abs(coef)),
+                    "selected": bool(abs(coef) >= coef_threshold),
+                    "alpha": float(alpha),
+                }
+            )
+
+    if not coef_rows:
+        return pd.DataFrame(
+            {
+                "feature": feature_cols,
+                "selection_frequency": np.nan,
+                "coef_bootstrap_mean": np.nan,
+                "coef_bootstrap_sd": np.nan,
+                "positive_frequency": np.nan,
+                "negative_frequency": np.nan,
+                "n_bootstrap_success": 0,
+            }
+        )
+
+    boot_df = pd.DataFrame(coef_rows)
+    rows = []
+    for feature in feature_cols:
+        grp = boot_df[boot_df["feature"] == feature]
+        rows.append(
+            {
+                "feature": feature,
+                "selection_frequency": float(grp["selected"].mean()),
+                "coef_bootstrap_mean": float(grp["coef"].mean()),
+                "coef_bootstrap_sd": float(grp["coef"].std(ddof=1)),
+                "positive_frequency": float((grp["coef"] > coef_threshold).mean()),
+                "negative_frequency": float((grp["coef"] < -coef_threshold).mean()),
+                "n_bootstrap_success": int(grp["bootstrap"].nunique()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _save_lasso_table_figure(table_df: pd.DataFrame, out_path: str, subset_label: str):
+    display_cols = [
+        "display_feature",
+        "coef",
+        "selection_frequency",
+        "coef_bootstrap_mean",
+        "coef_bootstrap_sd",
+        "selected",
+    ]
+    table = table_df[display_cols].copy()
+    table = table.rename(
+        columns={
+            "display_feature": "Feature",
+            "coef": "Coef",
+            "selection_frequency": "Sel. freq",
+            "coef_bootstrap_mean": "Boot mean",
+            "coef_bootstrap_sd": "Boot SD",
+            "selected": "Selected",
+        }
+    )
+    for col in ["Coef", "Sel. freq", "Boot mean", "Boot SD"]:
+        table[col] = table[col].map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
+    table["Selected"] = table["Selected"].map(lambda x: "Yes" if bool(x) else "No")
+
+    height = max(3.0, 0.42 * len(table) + 1.2)
+    fig, ax = plt.subplots(figsize=(11, height), dpi=150)
+    ax.axis("off")
+    ax.set_title(f"LASSO coefficient table ({subset_label})", fontsize=12, pad=10)
+    mpl_table = ax.table(
+        cellText=table.values,
+        colLabels=table.columns,
+        loc="center",
+        cellLoc="center",
+    )
+    mpl_table.auto_set_font_size(False)
+    mpl_table.set_fontsize(8)
+    mpl_table.scale(1, 1.25)
+    for (row, _col), cell in mpl_table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold")
+            cell.set_facecolor("#f0f0f0")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_path, "lasso_coefficients_table.png"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _prepare_xy(
         dataset: CombinedData,
         tech_name: str,
@@ -35,7 +212,9 @@ def run_pca_analysis(
     """执行 PCA 分析。"""
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行 PCA | 技巧：{tech_name} | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    subset_output = _subset_output_name(subset_types)
+    print(f"[*] 运行 PCA | 技巧：{tech_name} | 子集：{subset_display}")
 
     # 提取子集数据
     df_subset, X, y = _prepare_xy(dataset, tech_name, subset_types)
@@ -51,7 +230,7 @@ def run_pca_analysis(
     pca.fit(Xz)
 
     # 结果保存
-    out_path = os.path.join(output_dir, tech_name, subset_label)
+    out_path = os.path.join(output_dir, tech_name, subset_output)
     os.makedirs(out_path, exist_ok=True)
     # 保存原始数据
     df_subset.to_csv(os.path.join(out_path, f"feats_with_{tech_name}_score.csv"), index=False)
@@ -96,7 +275,7 @@ def run_pca_analysis(
                 color="white" if abs(val) > 0.6 else "black", fontsize=7,
             )
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_title(f"PCA Loadings ({tech_name} - {subset_label})")
+    ax.set_title(f"PCA Loadings ({tech_name} - {subset_display})")
     fig.tight_layout()
     fig.savefig(os.path.join(out_path, "pca_heatmap.png"), dpi=300)
     plt.close(fig)
@@ -113,7 +292,9 @@ def run_lasso_analysis(
     """执行 LASSO 分析。"""
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行 LASSO | 技巧：{tech_name} | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    subset_output = _subset_output_name(subset_types)
+    print(f"[*] 运行 LASSO | 技巧：{tech_name} | 子集：{subset_display}")
 
     # 提取子集数据
     df_subset, X, y = _prepare_xy(dataset, tech_name, subset_types)
@@ -121,49 +302,109 @@ def run_lasso_analysis(
         print("[!] 跳过：有效样本不足。")
         return
 
-    # 标准化 & LASSO
-    scaler = StandardScaler()
-    Xz = scaler.fit_transform(X)
-    model = LassoCV(cv=5, random_state=42, n_alphas=100, max_iter=10000)
-    model.fit(Xz, y)
+    # Standardized linear LASSO. The ordinal score is treated as a numeric
+    # exploratory approximation; confirmatory inference should use ordinal models.
+    coefs_raw, alpha = _fit_lasso_cv_coefficients(X, y, random_state=42)
 
     # 结果整理
-    coefs = pd.Series(model.coef_, index=dataset.feat_cols)
+    coefs = pd.Series(coefs_raw, index=dataset.feat_cols)
+    stability_df = _lasso_bootstrap_stability(
+        X,
+        y,
+        dataset.feat_cols,
+        n_bootstrap=200,
+        coef_threshold=0.01,
+        random_state=42,
+    )
     coef_df = pd.DataFrame(
         {
             "feature": dataset.feat_cols,
+            "display_feature": [_display_feature_name(f) for f in dataset.feat_cols],
             "coef": coefs.values,
             "abs_coef": np.abs(coefs.values),
         },
-    ).sort_values(by="abs_coef", ascending=False)
+    )
+    coef_df = coef_df.merge(stability_df, on="feature", how="left")
+    coef_df["alpha"] = float(alpha)
+    coef_df = coef_df.sort_values(by="abs_coef", ascending=False)
     coef_df["selected"] = np.abs(coef_df["coef"]) >= 0.01
 
     # 保存
-    out_path = os.path.join(output_dir, tech_name, subset_label)
+    out_path = os.path.join(output_dir, tech_name, subset_output)
     os.makedirs(out_path, exist_ok=True)
     # 0. 保存原始数据
     df_subset.to_csv(os.path.join(out_path, f"feats_with_{tech_name}_score.csv"), index=False)
     # 1. 保存系数 CSV
     coef_df.to_csv(os.path.join(out_path, "lasso_coefficients.csv"), index=False)
+    coef_df.to_csv(os.path.join(out_path, "lasso_coefficients_table.csv"), index=False)
+    stability_df.to_csv(os.path.join(out_path, "lasso_stability_bootstrap.csv"), index=False)
+    with open(os.path.join(out_path, "lasso_model_note.txt"), "w", encoding="utf-8") as f:
+        f.write("Linear LASSO is used here as an exploratory sparse approximation.\n")
+        f.write("The A/B/C ordinal labels are represented by numeric scores for this model, so the fit assumes equal spacing between adjacent ordinal levels.\n")
+        f.write("This assumption is not used as confirmatory ordinal inference; use ordered logistic/probit models for that purpose.\n")
+        f.write("LASSO coefficients are multivariate standardized conditional effects, so a variable can be important even when its univariate scatter trend is visually modest.\n")
+        f.write("Bootstrap selection_frequency estimates whether the selected features remain selected under stratified resampling.\n")
     # 2. 绘图
     fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
     # 准备数据
-    features = coef_df["feature"].tolist()
+    features = coef_df["display_feature"].tolist()
     coefficients = coef_df["coef"].values
     n_features = len(features)
     # 生成颜色列表
-    colors = ['#1f77b4' if c > 0 else '#d62728' for c in coefficients]
-    ax.bar(features, coefficients, color=colors, edgecolor='gray', linewidth=0.5)
+    colors = [
+        '#1f77b4' if c > 0 else '#d62728' if c < 0 else '#9aa0a6'
+        for c in coefficients
+    ]
+    positions = np.arange(n_features)
+    bars = ax.bar(positions, coefficients, color=colors, edgecolor='gray', linewidth=0.5)
     ax.axhline(0, color="#333", linewidth=1)
     ax.set_ylabel("Coefficient (Standardized)")
-    ax.set_title(f"LASSO Coefficients ({tech_name} - {subset_label})")
-    ax.set_ylim(-1, 1)
-    ax.set_xticks(range(n_features))
+    ax.set_title(f"LASSO Coefficients ({tech_name} - {subset_display})")
+    ylim = max(1.0, float(np.nanmax(np.abs(coefficients))) * 1.35 if len(coefficients) else 1.0)
+    ax.set_ylim(-ylim, ylim)
+    ax.set_xticks(positions)
     ax.set_xticklabels(features, rotation=45, ha="right", fontsize=8)
+    label_offset = 0.035 * ylim
+    selection_freqs = coef_df["selection_frequency"].to_numpy(dtype=float)
+    for i, (bar, coef, sel_freq) in enumerate(zip(bars, coefficients, selection_freqs)):
+        if abs(coef) < 0.005:
+            y = label_offset
+            va = "bottom"
+            ax.scatter(
+                i,
+                0,
+                s=20,
+                facecolor="white",
+                edgecolor="#555555",
+                linewidth=0.8,
+                zorder=4,
+            )
+        elif coef > 0:
+            y = coef + label_offset
+            va = "bottom"
+        else:
+            y = coef - label_offset
+            va = "top"
+        label = f"{coef:.3f}"
+        if np.isfinite(sel_freq):
+            label += f"\nsel {sel_freq:.2f}"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y,
+            label,
+            ha="center",
+            va=va,
+            fontsize=7,
+            color="#222222",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6},
+            zorder=5,
+        )
     ax.grid(axis='y', linestyle='--', alpha=0.3)
-    fig.tight_layout()
+    ax.margins(x=0.04)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(os.path.join(out_path, "lasso_barplot.png"), dpi=300)
     plt.close(fig)
+    _save_lasso_table_figure(coef_df, out_path, subset_display)
 
     selected = coef_df[coef_df["selected"]]["feature"].tolist()
     print(f"[+] LASSO 完成 (选中特征: {len(selected)})")
@@ -181,7 +422,9 @@ def run_ordinal_regression(
     """
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行序数回归 | 技巧：{tech_name} | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    subset_output = _subset_output_name(subset_types)
+    print(f"[*] 运行序数回归 | 技巧：{tech_name} | 子集：{subset_display}")
 
     # 提取子集数据
     df_subset, X, y = _prepare_xy(dataset, tech_name, subset_types)
@@ -208,7 +451,7 @@ def run_ordinal_regression(
         return
 
     # 保存结果
-    out_path = os.path.join(output_dir, tech_name, subset_label)
+    out_path = os.path.join(output_dir, tech_name, subset_output)
     os.makedirs(out_path, exist_ok=True)
     # 0. 保存原始数据集 (含评分和原始特征)
     df_output = df_subset.copy()
@@ -240,7 +483,7 @@ def run_ordinal_regression(
     with open(os.path.join(out_path, "ordinal_regression_summary.txt"), "w", encoding="utf-8") as f:
         f.write(f"Ordinal Regression Summary\n")
         f.write(f"Technique: {tech_name}\n")
-        f.write(f"Subset: {subset_label}\n")
+        f.write(f"Subset: {subset_display}\n")
         f.write(f"Link Function: Probit\n")
         f.write("=" * 60 + "\n\n")
         f.write(summary_text)
@@ -262,7 +505,8 @@ def run_correlation_matrix(
     """
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行全局关联矩阵分析 | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    print(f"[*] 运行全局关联矩阵分析 | 子集：{subset_display}")
 
     tech_cols = dataset.tech_cols  # 10个技巧
     feat_cols = dataset.feat_cols  # 9个声学特征
@@ -358,7 +602,7 @@ def run_correlation_matrix(
         linewidths=0.5,
         cbar_kws={"label": "Spearman Correlation Coefficient"}
     )
-    plt.title(f"Global Correlation Matrix: Techniques vs Acoustic Features\n(Subsets: {subset_label})", fontsize=14)
+    plt.title(f"Global Correlation Matrix: Techniques vs Acoustic Features\n(Subsets: {subset_display})", fontsize=14)
     plt.xlabel("Acoustic Features", fontsize=12)
     plt.ylabel("Vocal Techniques", fontsize=12)
     plt.tight_layout()
@@ -386,7 +630,8 @@ def run_lasso_correlation_matrix(
     """
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行 Lasso 关联矩阵 | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    print(f"[*] 运行 Lasso 关联矩阵 | 子集：{subset_display}")
 
     tech_cols = dataset.tech_cols
     feat_cols = dataset.feat_cols
@@ -413,7 +658,7 @@ def run_lasso_correlation_matrix(
 
         # 运行 LassoCV
         try:
-            model = LassoCV(cv=5, random_state=42, max_iter=10000, n_alphas=100)
+            model = LassoCV(cv=5, random_state=42, max_iter=10000, alphas=100)
             model.fit(Xz, y)
             coefs = model.coef_
         except Exception as e:
@@ -447,7 +692,7 @@ def run_lasso_correlation_matrix(
         linewidths=0.5,
         cbar_kws={"label": "Standardized Coefficient"}
     )
-    plt.title(f"Lasso Correlation Matrix (Multivariate)\n(Subsets: {subset_label})", fontsize=14)
+    plt.title(f"Lasso Correlation Matrix (Multivariate)\n(Subsets: {subset_display})", fontsize=14)
     plt.xlabel("Acoustic Features")
     plt.ylabel("Vocal Techniques")
     plt.tight_layout()
@@ -473,7 +718,8 @@ def run_ordinal_correlation_matrix(
     """
     subset_types = subset_types if subset_types else ["A", "B", "1"]
     subset_label = "+".join(subset_types)
-    print(f"[*] 运行序数回归关联矩阵 ({metric}) | 子集：{subset_label}")
+    subset_display = _display_subset_name(subset_types)
+    print(f"[*] 运行序数回归关联矩阵 ({metric}) | 子集：{subset_display}")
 
     tech_cols = dataset.tech_cols
     feat_cols = dataset.feat_cols
@@ -577,7 +823,7 @@ def run_ordinal_correlation_matrix(
     )
 
     title_suffix = "Log(Odds Ratio)" if metric == "or" else "Coefficients"
-    plt.title(f"Ordinal Regression Matrix ({title_suffix}, p<0.05)\n(Subsets: {subset_label})", fontsize=14)
+    plt.title(f"Ordinal Regression Matrix ({title_suffix}, p<0.05)\n(Subsets: {subset_display})", fontsize=14)
     plt.xlabel("Acoustic Features")
     plt.ylabel("Vocal Techniques")
     plt.tight_layout()

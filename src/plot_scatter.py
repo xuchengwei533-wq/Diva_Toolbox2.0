@@ -1,5 +1,6 @@
 import os
 import sys
+import warnings
 from itertools import combinations
 
 import matplotlib.pyplot as plt
@@ -14,8 +15,10 @@ except Exception:
     Image = None
 try:
     from scipy.stats import gaussian_kde
+    from scipy.stats import t as student_t
 except Exception:
     gaussian_kde = None
+    student_t = None
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -27,7 +30,8 @@ from src.data_parser import parse_label, parse_suffix_type, parse_pitch_digit
 # 配置与常量
 # ==============================================================================
 
-# 定义数据集子集组合，分别为 A+1、B+1、A+B+1（All）
+# Internal subset combinations. Display labels are Pressed phonation,
+# Breathy phonation, and ALL.
 SUBSET_GROUPS = [
     ["A", "1"],
     ["B", "1"],
@@ -62,7 +66,7 @@ LEGACY_FEATURE_ALIASES = {
     "QValue": "Q1",
     "H1H2": "H1H2_output",
 }
-SUBSET_TITLES = ["A1", "B1", "ALL"]
+SUBSET_TITLES = ["Pressed phonation", "Breathy phonation", "ALL"]
 PAPER_DPI = 300
 
 
@@ -233,7 +237,7 @@ def _feature_file_token(name):
         "HNR": "HNR",
         "SpectralSlope": "SpectralSlope",
         "LowFreqEnergyRatio": "LowFreqEnergyRatio",
-        "HighFreqNoiseRatio": "HighFreqNoiseRatio",
+        "HighFreqNoiseRatio": "HF residual-noise ratio",
         "Jitter": "Jitter",
         "Shimmer": "Shimmer",
     }
@@ -298,6 +302,7 @@ def _plot_1d_scatter(ax, coords, scores, pitches_arr, feat_tuple, is_last_subset
     for cls in CLASS_ORDER:
         mask = np.asarray([c == cls for c in class_labels])
         if np.any(mask):
+            class_index = CLASS_ORDER.index(cls)
             ax.scatter(
                 x_coords[mask],
                 y_coords[mask],
@@ -308,6 +313,50 @@ def _plot_1d_scatter(ax, coords, scores, pitches_arr, feat_tuple, is_last_subset
                 linewidths=0.3,
                 label=cls,
             )
+            vals = y_coords[mask]
+            stats = _summary_stats(vals)
+            if stats["n"] > 0:
+                ax.hlines(
+                    stats["median"],
+                    class_index - 0.24,
+                    class_index + 0.24,
+                    color="#222222",
+                    linewidth=1.6,
+                    zorder=4,
+                )
+                if np.isfinite(stats["mean"]):
+                    if np.isfinite(stats["ci95_low"]) and np.isfinite(stats["ci95_high"]):
+                        yerr = np.array(
+                            [
+                                [stats["mean"] - stats["ci95_low"]],
+                                [stats["ci95_high"] - stats["mean"]],
+                            ]
+                        )
+                    else:
+                        yerr = None
+                    ax.errorbar(
+                        [class_index],
+                        [stats["mean"]],
+                        yerr=yerr,
+                        fmt="D",
+                        color="#111111",
+                        ecolor="#111111",
+                        elinewidth=1.0,
+                        capsize=4,
+                        markersize=4.5,
+                        zorder=5,
+                    )
+                ax.text(
+                    class_index,
+                    0.965,
+                    f"n={stats['n']}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="center",
+                    va="top",
+                    fontsize=8,
+                    color="#333333",
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.72, pad=0.8),
+                )
 
     ax.set_xlabel("Resonance category")
     ax.set_ylabel(_pretty_feature_label(feat_tuple[0]))
@@ -316,7 +365,75 @@ def _plot_1d_scatter(ax, coords, scores, pitches_arr, feat_tuple, is_last_subset
 
     if is_last_subset:
         handles = create_legend_handles_class(ax)
-        ax.legend(handles=handles, title="Category", loc="upper right", fontsize=8)
+        stat_handles = [
+            Line2D([0], [0], marker="D", color="#111111", linestyle="", markersize=5, label="Mean +/- 95% CI"),
+            Line2D([0], [0], color="#222222", linewidth=1.6, label="Median"),
+        ]
+        ax.legend(
+            handles=handles + stat_handles,
+            title="Category",
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+        )
+
+
+def _summary_stats(values):
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    n = int(vals.size)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean": np.nan,
+            "sd": np.nan,
+            "median": np.nan,
+            "q1": np.nan,
+            "q3": np.nan,
+            "iqr": np.nan,
+            "ci95_low": np.nan,
+            "ci95_high": np.nan,
+        }
+    mean = float(np.mean(vals))
+    sd = float(np.std(vals, ddof=1)) if n > 1 else np.nan
+    median = float(np.median(vals))
+    q1, q3 = np.percentile(vals, [25, 75])
+    if n > 1 and np.isfinite(sd):
+        crit = float(student_t.ppf(0.975, n - 1)) if student_t is not None else 1.96
+        half_width = crit * sd / np.sqrt(n)
+        ci95_low = mean - half_width
+        ci95_high = mean + half_width
+    else:
+        ci95_low = np.nan
+        ci95_high = np.nan
+    return {
+        "n": n,
+        "mean": mean,
+        "sd": sd,
+        "median": median,
+        "q1": float(q1),
+        "q3": float(q3),
+        "iqr": float(q3 - q1),
+        "ci95_low": float(ci95_low) if np.isfinite(ci95_low) else np.nan,
+        "ci95_high": float(ci95_high) if np.isfinite(ci95_high) else np.nan,
+    }
+
+
+def _summarize_1d_panel(df_panel, feature, panel_title):
+    rows = []
+    for cls in CLASS_ORDER:
+        vals = df_panel.loc[df_panel["score_class"] == cls, feature].values
+        stats = _summary_stats(vals)
+        row = {
+            "panel": panel_title,
+            "category": cls,
+            "feature": feature,
+            "display_feature": _pretty_feature_label(feature),
+        }
+        row.update(stats)
+        rows.append(row)
+    return rows
 
 
 def _plot_2d_scatter(ax, coords, scores, feat_tuple, is_last_subset):
@@ -365,7 +482,7 @@ def _plot_2d_scatter(ax, coords, scores, feat_tuple, is_last_subset):
         ax.legend(handles=handles, title="Category", loc="upper right", fontsize=8)
 
 
-def _plot_3d_scatter(ax, coords, scores, feat_tuple):
+def _plot_3d_scatter(ax, coords, scores, feat_tuple, show_legend=True):
     """
     Plot 3D scatter. Color encodes resonance category A/B/C.
     """
@@ -393,8 +510,9 @@ def _plot_3d_scatter(ax, coords, scores, feat_tuple):
     ax.set_xlabel(_pretty_feature_label(feat_tuple[0]))
     ax.set_ylabel(_pretty_feature_label(feat_tuple[1]))
     ax.set_zlabel(_pretty_feature_label(feat_tuple[2]))
-    handles = create_legend_handles_class(ax)
-    ax.legend(handles=handles, title="Category", loc="upper left", fontsize=8)
+    if show_legend:
+        handles = create_legend_handles_class(ax)
+        ax.legend(handles=handles, title="Category", loc="upper left", fontsize=8)
 
 
 def _clean_numeric_panel_df(df, feat_names):
@@ -617,17 +735,38 @@ def _feature_display_name(col):
     return _pretty_feature_label(col)
 
 
+def _robust_long_tail_ylim(values):
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None
+
+    q1, q3 = np.percentile(vals, [25, 75])
+    iqr = q3 - q1
+    q90 = np.percentile(vals, 90)
+    q95 = np.percentile(vals, 95)
+    if not np.isfinite(iqr) or iqr <= 1e-12:
+        return _compute_axis_limits(vals)
+
+    upper = max(q90 * 1.10, min(q95, q3 + 3.0 * iqr))
+    upper = max(upper, q3 + 1.0 * iqr)
+    upper = float(np.ceil((upper * 1.08) / 5.0) * 5.0)
+    upper = min(upper, 30.0)
+    lower = min(0.0, float(np.percentile(vals, 1)))
+    return lower, upper
+
+
 def _pretty_feature_label(name):
     mapping = {
         "H1H2_output": "H1H2 (dB)",
         "H1H2": "H1H2 (dB)",
         "CPP": "CPP (dB)",
-        "Q1": "Q1 (a.u.)",
-        "QValue": "Q1 (a.u.)",
+        "Q1": "Q1 (dimensionless)",
+        "QValue": "Q1 (dimensionless)",
         "HNR": "HNR (dB)",
         "SpectralSlope": "Spectral slope",
         "LowFreqEnergyRatio": "Low-frequency energy ratio",
-        "HighFreqNoiseRatio": "High-frequency residual noise ratio",
+        "HighFreqNoiseRatio": "HF residual-noise ratio",
         "Jitter": "Jitter",
         "Shimmer": "Shimmer",
     }
@@ -644,6 +783,10 @@ def _plot_joint_2d_panel(
         is_last=False,
         shared_xlim=None,
         shared_ylim=None,
+        clip_to_limits=False,
+        show_x_label=True,
+        show_y_label=True,
+        show_legend=True,
 ):
     """
     单个 2D joint panel：
@@ -663,47 +806,107 @@ def _plot_joint_2d_panel(
     ax_empty = fig.add_subplot(inner[0, 1])
     ax_empty.axis("off")
 
+    clipped_total = 0
     for cls in CLASS_ORDER:
         grp = df_panel[df_panel["score_class"] == cls]
         if grp.empty:
             continue
         color = CLASS_COLOR_MAP[cls]
-        x, y, used_ellipse = _filter_xy_by_cov_ellipse_2d(
-            grp[x_col].values,
-            grp[y_col].values,
-            n_std=2.0,
-        )
+        if clip_to_limits:
+            x = pd.to_numeric(grp[x_col], errors="coerce").to_numpy(dtype=float)
+            y = pd.to_numeric(grp[y_col], errors="coerce").to_numpy(dtype=float)
+            finite = np.isfinite(x) & np.isfinite(y)
+            x = x[finite]
+            y = y[finite]
+            used_ellipse = x.size >= 3
+        else:
+            x, y, used_ellipse = _filter_xy_by_cov_ellipse_2d(
+                grp[x_col].values,
+                grp[y_col].values,
+                n_std=2.0,
+            )
         if x.size == 0:
             continue
-        ax_main.scatter(
-            x, y,
-            s=20,
-            alpha=0.78,
-            c=color,
-            edgecolors="#4a4a4a",
-            linewidths=0.35,
-            zorder=3,
-        )
-        if used_ellipse:
-            _add_cov_ellipse_2d(ax_main, x, y, color=color, n_std=2.0)
 
-        ax_top.hist(x, bins=16, density=True, color=color, alpha=0.25, edgecolor="none")
-        if shared_xlim is not None:
-            x_grid = np.linspace(shared_xlim[0], shared_xlim[1], 220)
-        else:
-            x_grid = np.linspace(np.min(x), np.max(x), 220)
-        x_kde = _kde_1d(x, x_grid)
-        if x_kde is not None:
-            ax_top.plot(x_grid, x_kde, color=color, linestyle="--", linewidth=1.4)
+        if clip_to_limits and shared_ylim is not None:
+            ymin, ymax = shared_ylim
+            xmask = np.ones_like(x, dtype=bool)
+            if shared_xlim is not None:
+                xmask &= (x >= shared_xlim[0]) & (x <= shared_xlim[1])
+            in_view = xmask & (y >= ymin) & (y <= ymax)
+            above_view = xmask & (y > ymax)
+            below_view = xmask & (y < ymin)
+            clipped_total += int(np.count_nonzero(above_view) + np.count_nonzero(below_view))
 
-        ax_right.hist(y, bins=16, density=True, orientation="horizontal", color=color, alpha=0.25, edgecolor="none")
-        if shared_ylim is not None:
-            y_grid = np.linspace(shared_ylim[0], shared_ylim[1], 220)
+            x_scatter = x[in_view]
+            y_scatter = y[in_view]
+            if x_scatter.size == 0 and not np.any(above_view) and not np.any(below_view):
+                continue
         else:
-            y_grid = np.linspace(np.min(y), np.max(y), 220)
-        y_kde = _kde_1d(y, y_grid)
-        if y_kde is not None:
-            ax_right.plot(y_kde, y_grid, color=color, linestyle="--", linewidth=1.4)
+            in_view = np.ones_like(x, dtype=bool)
+            above_view = np.zeros_like(x, dtype=bool)
+            below_view = np.zeros_like(x, dtype=bool)
+            x_scatter = x
+            y_scatter = y
+
+        if x_scatter.size > 0:
+            ax_main.scatter(
+                x_scatter, y_scatter,
+                s=20,
+                alpha=0.78,
+                c=color,
+                edgecolors="#4a4a4a",
+                linewidths=0.35,
+                zorder=3,
+            )
+        if clip_to_limits and shared_ylim is not None:
+            ymin, ymax = shared_ylim
+            span = max(ymax - ymin, 1e-6)
+            if np.any(above_view):
+                ax_main.scatter(
+                    x[above_view],
+                    np.full(np.count_nonzero(above_view), ymax - 0.025 * span),
+                    s=28,
+                    marker="^",
+                    alpha=0.85,
+                    c=color,
+                    edgecolors="#4a4a4a",
+                    linewidths=0.35,
+                    zorder=4,
+                )
+            if np.any(below_view):
+                ax_main.scatter(
+                    x[below_view],
+                    np.full(np.count_nonzero(below_view), ymin + 0.025 * span),
+                    s=28,
+                    marker="v",
+                    alpha=0.85,
+                    c=color,
+                    edgecolors="#4a4a4a",
+                    linewidths=0.35,
+                    zorder=4,
+                )
+        if used_ellipse and x_scatter.size >= 3:
+            _add_cov_ellipse_2d(ax_main, x_scatter, y_scatter, color=color, n_std=2.0)
+
+        if x_scatter.size > 0:
+            ax_top.hist(x_scatter, bins=16, density=True, color=color, alpha=0.25, edgecolor="none")
+            if shared_xlim is not None:
+                x_grid = np.linspace(shared_xlim[0], shared_xlim[1], 220)
+            else:
+                x_grid = np.linspace(np.min(x_scatter), np.max(x_scatter), 220)
+            x_kde = _kde_1d(x_scatter, x_grid)
+            if x_kde is not None:
+                ax_top.plot(x_grid, x_kde, color=color, linestyle="--", linewidth=1.4)
+
+            ax_right.hist(y_scatter, bins=16, density=True, orientation="horizontal", color=color, alpha=0.25, edgecolor="none")
+            if shared_ylim is not None:
+                y_grid = np.linspace(shared_ylim[0], shared_ylim[1], 220)
+            else:
+                y_grid = np.linspace(np.min(y_scatter), np.max(y_scatter), 220)
+            y_kde = _kde_1d(y_scatter, y_grid)
+            if y_kde is not None:
+                ax_right.plot(y_kde, y_grid, color=color, linestyle="--", linewidth=1.4)
 
     if shared_xlim is not None:
         ax_main.set_xlim(*shared_xlim)
@@ -716,20 +919,35 @@ def _plot_joint_2d_panel(
     ax_right.tick_params(axis="x", labelbottom=False)
     ax_right.tick_params(axis="y", labelleft=False)
     ax_main.grid(True, linestyle="--", alpha=0.26)
-    ax_main.set_xlabel(_feature_display_name(x_col), fontsize=10)
-    ax_main.set_ylabel(_feature_display_name(y_col), fontsize=10)
+    ax_main.set_xlabel(_feature_display_name(x_col) if show_x_label else "", fontsize=10)
+    ax_main.set_ylabel(_feature_display_name(y_col) if show_y_label else "", fontsize=10)
+    if not show_y_label:
+        ax_main.tick_params(axis="y", labelleft=False)
+    if clipped_total:
+        ax_main.text(
+            0.012,
+            0.965,
+            f"{clipped_total} Q1 outlier(s) shown at axis limit",
+            transform=ax_main.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7,
+            color="#444444",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.78, pad=1.2),
+        )
 
     legend_handles = [
         Line2D([0], [0], marker="o", linestyle="", color="w", markerfacecolor=CLASS_COLOR_MAP[cls],
                markeredgecolor="#4a4a4a", markeredgewidth=0.35, markersize=7, label=cls)
         for cls in CLASS_ORDER
     ]
-    ax_main.legend(handles=legend_handles, title=None, fontsize=8, loc="upper right", frameon=True)
-    if not is_last:
+    if show_legend:
+        ax_main.legend(handles=legend_handles, title=None, fontsize=8, loc="upper right", frameon=True)
+    if (not is_last) or (not show_x_label):
         ax_main.tick_params(axis="x", labelbottom=False)
 
 
-def generate_paper_2d_joint_vertical(
+def generate_paper_2d_joint_horizontal(
         df_stats,
         outputs_root,
         x_col="H1H2_output",
@@ -737,11 +955,11 @@ def generate_paper_2d_joint_vertical(
         pitch_name="chest",
 ):
     """
-    论文风格 2D joint 可视化（竖向 A1/B1/ALL）：
+    论文风格 2D joint 可视化（横向 Pressed phonation/Breathy phonation/ALL）：
     仅展示分布结构（散点 + 协方差椭圆 + 边际分布），不是分类边界。
     """
     df_stats = normalize_feature_naming(df_stats)
-    df_full = enrich_df_with_metadata(df_stats)
+    df_full = remove_outlier_jitter_df(enrich_df_with_metadata(df_stats))
 
     panel_dfs = []
     for subset_group in SUBSET_GROUPS:
@@ -756,19 +974,24 @@ def generate_paper_2d_joint_vertical(
     x_all = np.concatenate([d[x_col].values for d in valid_panels])
     y_all = np.concatenate([d[y_col].values for d in valid_panels])
     shared_xlim = _compute_axis_limits(x_all)
-    shared_ylim = _compute_axis_limits(y_all)
+    use_robust_y_zoom = y_col in {"Q1", "QValue"}
+    shared_ylim = _robust_long_tail_ylim(y_all) if use_robust_y_zoom else _compute_axis_limits(y_all)
 
-    fig = plt.figure(figsize=(8.0, 13.5), dpi=PAPER_DPI, facecolor="white")
-    outer = fig.add_gridspec(nrows=3, ncols=1, hspace=0.34)
+    fig = plt.figure(figsize=(15.0, 4.9), dpi=PAPER_DPI, facecolor="white")
+    outer = fig.add_gridspec(nrows=1, ncols=3, wspace=0.16)
     for i, (panel_df, panel_title) in enumerate(zip(panel_dfs, SUBSET_TITLES)):
         if panel_df.empty:
-            ax = fig.add_subplot(outer[i, 0])
+            ax = fig.add_subplot(outer[0, i])
             ax.axis("off")
             ax.set_title(f"{panel_title} (No Data)", fontsize=11)
             continue
         _plot_joint_2d_panel(
-            fig, outer[i, 0], panel_df, x_col, y_col, panel_title,
-            is_last=(i == 2), shared_xlim=shared_xlim, shared_ylim=shared_ylim,
+            fig, outer[0, i], panel_df, x_col, y_col, panel_title,
+            is_last=True, shared_xlim=shared_xlim, shared_ylim=shared_ylim,
+            clip_to_limits=use_robust_y_zoom,
+            show_x_label=True,
+            show_y_label=(i == 0),
+            show_legend=(i == 2),
         )
 
     fig.suptitle(
@@ -776,15 +999,24 @@ def generate_paper_2d_joint_vertical(
         fontsize=13,
         y=0.995,
     )
-    out_dir = os.path.join(outputs_root, "plot_2d_joint_vertical")
-    stem = f"{pitch_name}_{_feature_file_token(x_col)}_vs_{_feature_file_token(y_col)}_vertical"
+    out_dir = os.path.join(outputs_root, "plot_2d_joint_horizontal")
+    stem = f"{pitch_name}_{_feature_file_token(x_col)}_vs_{_feature_file_token(y_col)}_horizontal"
     saved = _save_figure(fig, out_dir, stem, dpi=PAPER_DPI, save_png=True, save_jpg=False)
     pdf_path = os.path.join(out_dir, f"{stem}.pdf")
     fig.savefig(pdf_path, dpi=PAPER_DPI, bbox_inches="tight")
+    if use_robust_y_zoom:
+        zoom_stem = f"{stem}_zoomed"
+        saved.extend(_save_figure(fig, out_dir, zoom_stem, dpi=PAPER_DPI, save_png=True, save_jpg=False))
+        fig.savefig(os.path.join(out_dir, f"{zoom_stem}.pdf"), dpi=PAPER_DPI, bbox_inches="tight")
     plt.close(fig)
     for p in saved:
         print(f"[+] Paper 2D 图已保存：{p}")
     print(f"[+] Paper 2D 图已保存：{pdf_path}")
+
+
+def generate_paper_2d_joint_vertical(*args, **kwargs):
+    """Backward-compatible wrapper: paper 2D triptychs are now generated horizontally."""
+    return generate_paper_2d_joint_horizontal(*args, **kwargs)
 
 
 def _ellipsoid_mesh_from_cov(points, n_std=2.0, n_u=32, n_v=16):
@@ -949,11 +1181,11 @@ def generate_paper_3d_ellipsoid_vertical(
         pitch_name="chest",
 ):
     """
-    论文风格 3D 可视化（竖向 A1/B1/ALL）：
+    论文风格 3D 可视化（竖向 Pressed phonation/Breathy phonation/ALL）：
     3D scatter + covariance ellipsoid，用于展示分布趋势而非分类边界。
     """
     df_stats = normalize_feature_naming(df_stats)
-    df_full = enrich_df_with_metadata(df_stats)
+    df_full = remove_outlier_jitter_df(enrich_df_with_metadata(df_stats))
 
     panel_dfs = []
     for subset_group in SUBSET_GROUPS:
@@ -1026,11 +1258,11 @@ def generate_paper_3d_ellipsoid_horizontal(
         pitch_name="chest",
 ):
     """
-    论文风格 3D 可视化（横向 A1/B1/ALL）：
+    论文风格 3D 可视化（横向 Pressed phonation/Breathy phonation/ALL）：
     3D scatter + covariance ellipsoid，用于展示分布趋势而非分类边界。
     """
     df_stats = normalize_feature_naming(df_stats)
-    df_full = enrich_df_with_metadata(df_stats)
+    df_full = remove_outlier_jitter_df(enrich_df_with_metadata(df_stats))
 
     panel_dfs = []
     for subset_group in SUBSET_GROUPS:
@@ -1083,7 +1315,7 @@ def generate_paper_3d_ellipsoid_horizontal(
     for ax in axes:
         pos = ax.get_position()
         new_y0 = max(0.0, pos.y0 - 0.01)
-        # 顶部限制在 0.90，给 suptitle 与 A1/B1/ALL 留出清晰间隔，避免视觉重复/重叠
+        # 顶部限制在 0.90，给 suptitle 与三个面板标题留出清晰间隔，避免视觉重复/重叠
         new_h = min(0.90 - new_y0, pos.height + 0.02)
         ax.set_position([pos.x0, new_y0, pos.width, new_h])
     out_dir = os.path.join(outputs_root, "plot_3d_ellipsoid_horizontal")
@@ -1126,7 +1358,7 @@ def plot_scatter_ndim(
     在 outputs_root 下的 "plot_1d" / "plot_2d" / "plot_3d" 目录中保存所有生成的图像。
     根据 ndim 参数，排列组合出所有 ndim 个特征统计值的组合，
     为每个特征统计值组合创建一个图像。
-    每个图像分三个子图，分别展示不同数据子集（A+1、B+1、A+B+1（All））的特征值与打分标签的关系。
+    每个图像分三个子图，分别展示 pressed phonation、breathy phonation 和 ALL 子集的特征值与打分标签的关系。
     - 1D: x 轴为评分标签，y 轴为一个特征的统计量，点的颜色和形状根据音高区分。
     - 2D/3D: x, y(, z) 轴为声学特征统计值，点的颜色代表评分标签。
 
@@ -1170,8 +1402,9 @@ def plot_scatter_ndim(
     os.makedirs(plot_dir, exist_ok=True)
 
     # 2. 遍历特征组合进行绘图
+    all_1d_summary_rows = []
     for feat_tuple in feat_combinations:
-        # 1D：按 A1/B1/ALL 三个子集竖向拼接
+        # 1D：按 Pressed phonation/Breathy phonation/ALL 三个子集横向拼接
         if ndim == 1:
             feat = feat_tuple[0]
             if feat not in df_full.columns:
@@ -1190,6 +1423,7 @@ def plot_scatter_ndim(
                 subset_payloads.append({
                     "coords": df_valid[[feat]].values,
                     "scores": df_valid["score_label"].values.astype(float),
+                    "df": df_valid.copy(),
                 })
 
             valid_payloads = [p for p in subset_payloads if p is not None]
@@ -1199,8 +1433,22 @@ def plot_scatter_ndim(
 
             y_all = np.concatenate([p["coords"][:, 0] for p in valid_payloads])
             shared_ylim = _compute_axis_limits(y_all)
+            feature_summary_rows = []
+            for panel_title, payload in zip(SUBSET_TITLES, subset_payloads):
+                if payload is None:
+                    continue
+                rows = _summarize_1d_panel(payload["df"], feat, panel_title)
+                feature_summary_rows.extend(rows)
+                all_1d_summary_rows.extend(rows)
+            if feature_summary_rows:
+                summary_df = pd.DataFrame(feature_summary_rows)
+                summary_path = os.path.join(
+                    plot_dir,
+                    f"summary_{_feature_file_token(feat)}_by_panel_category.csv",
+                )
+                summary_df.to_csv(summary_path, index=False)
 
-            fig, axes = plt.subplots(3, 1, figsize=(7, 12), dpi=DPI, sharex=True, sharey=False)
+            fig, axes = plt.subplots(1, 3, figsize=(13.2, 4.35), dpi=DPI, sharex=False, sharey=True)
             if not isinstance(axes, (list, np.ndarray)):
                 axes = [axes]
 
@@ -1224,19 +1472,19 @@ def plot_scatter_ndim(
                     ax.set_ylim(*shared_ylim)
                 ax.set_title(SUBSET_TITLES[i], fontsize=12)
                 ax.grid(True, linestyle="--", alpha=0.3)
-                if i < 2:
-                    ax.set_xlabel("")
-                    ax.tick_params(axis="x", labelbottom=False)
+                if i > 0:
+                    ax.set_ylabel("")
+                    ax.tick_params(axis="y", labelleft=False)
 
             fig.suptitle(f"{_pretty_feature_label(feat)}", fontsize=16)
-            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            fig.tight_layout(rect=[0.0, 0.0, 0.88, 0.91])
 
             stem = f"chest_{_feature_file_token(feat)}_1d"
             _save_figure(fig, plot_dir, stem, dpi=300)
             plt.close(fig)
             continue
 
-        # 2D / 3D：按 A1/B1/ALL 三个子集竖向拼接
+        # 2D / 3D：按 Pressed phonation/Breathy phonation/ALL 三个子集横向拼接
         subset_payloads = []
         for subset_group in SUBSET_GROUPS:
             df_subset = filter_df_by_subset(df_full, subset_group)
@@ -1292,8 +1540,8 @@ def plot_scatter_ndim(
             shared_zlim = _compute_axis_limits(z_all)
 
         if ndim == 3:
-            fig = plt.figure(figsize=(8.0, 13.0), dpi=DPI)
-            axes = [fig.add_subplot(3, 1, i + 1, projection='3d') for i in range(3)]
+            fig = plt.figure(figsize=(14.1, 4.3), dpi=DPI)
+            axes = [fig.add_subplot(1, 3, i + 1, projection='3d') for i in range(3)]
 
             for i, _subset_group in enumerate(SUBSET_GROUPS):
                 ax = axes[i]
@@ -1305,7 +1553,7 @@ def plot_scatter_ndim(
 
                 coords = payload["coords"]
                 scores = payload["scores"]
-                _plot_3d_scatter(ax, coords, scores, feat_tuple)
+                _plot_3d_scatter(ax, coords, scores, feat_tuple, show_legend=(i == 2))
 
                 if shared_xlim is not None:
                     ax.set_xlim(*shared_xlim)
@@ -1317,13 +1565,13 @@ def plot_scatter_ndim(
                 ax.set_title(SUBSET_TITLES[i], fontsize=12)
                 ax.grid(True, linestyle='--', alpha=0.3)
         else:
-            fig = plt.figure(figsize=(8.7, 13.1), dpi=DPI)
-            outer = fig.add_gridspec(3, 1, hspace=0.24)
+            fig = plt.figure(figsize=(15.0, 4.9), dpi=DPI)
+            outer = fig.add_gridspec(1, 3, wspace=0.16)
 
             for i, _subset_group in enumerate(SUBSET_GROUPS):
                 payload = subset_payloads[i]
                 if payload is None:
-                    ax = fig.add_subplot(outer[i, 0])
+                    ax = fig.add_subplot(outer[0, i])
                     ax.set_axis_off()
                     ax.set_title(f"{SUBSET_TITLES[i]} (No Data)")
                     continue
@@ -1343,36 +1591,54 @@ def plot_scatter_ndim(
 
                 _plot_joint_2d_panel(
                     fig,
-                    outer[i, 0],
+                    outer[0, i],
                     df_panel,
                     feat_tuple[0],
                     feat_tuple[1],
                     panel_title=SUBSET_TITLES[i],
-                    is_last=(i == 2),
+                    is_last=True,
                     shared_xlim=shared_xlim,
                     shared_ylim=shared_ylim,
+                    show_x_label=True,
+                    show_y_label=(i == 0),
+                    show_legend=(i == 2),
                 )
 
         if ndim == 2:
             fig.suptitle(
                 f"{_pretty_feature_label(feat_tuple[0])} vs {_pretty_feature_label(feat_tuple[1])}",
                 fontsize=16,
-                y=0.987,
+                y=0.995,
             )
-            stem = f"chest_{_feature_file_token(feat_tuple[0])}_vs_{_feature_file_token(feat_tuple[1])}_2d_vertical"
+            stem = f"chest_{_feature_file_token(feat_tuple[0])}_vs_{_feature_file_token(feat_tuple[1])}_2d_horizontal"
         else:
             fig.suptitle(
                 f"{_pretty_feature_label(feat_tuple[0])} vs {_pretty_feature_label(feat_tuple[1])} vs {_pretty_feature_label(feat_tuple[2])}",
-                fontsize=16,
-                y=0.987,
+                fontsize=13,
+                y=0.995,
             )
             stem = (
                 f"chest_{_feature_file_token(feat_tuple[0])}_vs_"
-                f"{_feature_file_token(feat_tuple[1])}_vs_{_feature_file_token(feat_tuple[2])}_3d_vertical"
+                f"{_feature_file_token(feat_tuple[1])}_vs_{_feature_file_token(feat_tuple[2])}_3d_horizontal"
             )
-        fig.tight_layout(rect=[0.012, 0.01, 0.995, 0.982], pad=0.28)
+        if ndim == 2:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="This figure includes Axes that are not compatible with tight_layout",
+                    category=UserWarning,
+                )
+                fig.tight_layout(rect=[0.012, 0.01, 0.995, 0.93], pad=0.24)
+        else:
+            fig.subplots_adjust(left=0.015, right=0.992, top=0.865, bottom=0.02, wspace=0.11)
         _save_figure(fig, plot_dir, stem, dpi=300, bbox_tight=True, pad_inches=0.015)
         plt.close(fig)
+
+    if ndim == 1 and all_1d_summary_rows:
+        pd.DataFrame(all_1d_summary_rows).to_csv(
+            os.path.join(plot_dir, "summary_all_1d_features_by_panel_category.csv"),
+            index=False,
+        )
 
     print(f"[+] {ndim}D 散点图绘制完成，共生成 {len(feat_combinations)} 张图像。")
 
@@ -1405,49 +1671,25 @@ if __name__ == '__main__':
         print(f"[*] 绘制 {ndim}D 散点图...")
         plot_scatter_ndim(df_feats_stats, outputs_root, ndim, feat_names=list(acoustic_feats))
 
-    generate_paper_2d_joint_vertical(
+    generate_paper_2d_joint_horizontal(
         df_feats_stats,
         outputs_root,
         x_col="H1H2_output",
         y_col="CPP",
         pitch_name="chest",
     )
-    generate_paper_2d_joint_vertical(
+    generate_paper_2d_joint_horizontal(
         df_feats_stats,
         outputs_root,
         x_col="H1H2_output",
         y_col="Q1",
         pitch_name="chest",
     )
-    generate_paper_2d_joint_vertical(
-        df_feats_stats,
-        outputs_root,
-        x_col="H1H2_output",
-        y_col="HighFreqNoiseRatio",
-        pitch_name="chest",
-    )
-    generate_paper_3d_ellipsoid_vertical(
-        df_feats_stats,
-        outputs_root,
-        x_col="H1H2_output",
-        y_col="Q1",
-        z_col="CPP",
-        pitch_name="chest",
-    )
-    generate_paper_3d_ellipsoid_vertical(
+    generate_paper_2d_joint_horizontal(
         df_feats_stats,
         outputs_root,
         x_col="H1H2_output",
         y_col="HNR",
-        z_col="CPP",
-        pitch_name="chest",
-    )
-    generate_paper_3d_ellipsoid_vertical(
-        df_feats_stats,
-        outputs_root,
-        x_col="HNR",
-        y_col="Q1",
-        z_col="CPP",
         pitch_name="chest",
     )
     generate_paper_3d_ellipsoid_horizontal(

@@ -22,7 +22,11 @@ from src.models import (
     run_lasso_correlation_matrix,
     run_ordinal_correlation_matrix,
 )
-from src.plot_scatter import plot_scatter_ndim
+from src.plot_scatter import (
+    generate_paper_2d_joint_horizontal,
+    generate_paper_3d_ellipsoid_horizontal,
+    plot_scatter_ndim,
+)
 from src.regression import run_ordinal_regression_with_stratified_kfold_cv
 from src.utils.config_loader import load_config
 
@@ -60,13 +64,13 @@ def _normalize_subset_groups(raw_subset_groups) -> List[List[str]]:
 
 
 def _matrix_dir_name(subsets: List[str]) -> str:
-    key = "".join(subsets)
-    if key == "A1":
-        return "matrix_A1"
-    if key == "B1":
-        return "matrix_B1"
-    if key == "AB1":
+    if subsets == ["A", "1"]:
+        return "matrix_pressed_phonation"
+    if subsets == ["B", "1"]:
+        return "matrix_breathy_phonation"
+    if subsets == ["A", "B", "1"]:
         return "matrix"
+    key = "".join(subsets)
     return f"matrix_{key}"
 
 
@@ -203,6 +207,35 @@ def run_pipeline(
     feat_names = list(cfg.acoustic_feats) if "acoustic_feats" in cfg else None
     for ndim in [1, 2, 3]:
         plot_scatter_ndim(df_stats, str(dataset_output_root), ndim, feat_names=feat_names)
+    log("[*] Step 3b/6: paper-style joint and ellipsoid plots")
+    paper_2d_pairs = [
+        ("H1H2_output", "CPP"),
+        ("H1H2_output", "Q1"),
+        ("H1H2_output", "HNR"),
+    ]
+    paper_3d_triplets = [
+        ("H1H2_output", "Q1", "CPP"),
+        ("H1H2_output", "HNR", "CPP"),
+    ]
+    for x_col, y_col in paper_2d_pairs:
+        if x_col in df_stats.columns and y_col in df_stats.columns:
+            generate_paper_2d_joint_horizontal(
+                df_stats,
+                str(dataset_output_root),
+                x_col=x_col,
+                y_col=y_col,
+                pitch_name="chest",
+            )
+    for x_col, y_col, z_col in paper_3d_triplets:
+        if all(col in df_stats.columns for col in [x_col, y_col, z_col]):
+            generate_paper_3d_ellipsoid_horizontal(
+                df_stats,
+                str(dataset_output_root),
+                x_col=x_col,
+                y_col=y_col,
+                z_col=z_col,
+                pitch_name="chest",
+            )
     if progress_callback is not None:
         progress_callback(90.0, f"{dataset_name}: 已完成散点图")
 
